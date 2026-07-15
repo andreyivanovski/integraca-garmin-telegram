@@ -100,6 +100,7 @@ Copie de `.env.example`:
 | `TELEGRAM_BOT_TOKEN` | sim* | Token do BotFather (*sem token o bot não sobe) |
 | `TELEGRAM_ALLOWED_CHAT_IDS` | sim* | IDs liberados, separados por vírgula |
 | `DEFAULT_DEVICE_ID` | recomendado | ID do seu relógio no Garmin Connect |
+| `GARMIN_EMAIL` / `GARMIN_PASSWORD` | recomendado | Login Garmin nos chats liberados (Telegram não pede senha) |
 | `DATA_DIR` | não | Pasta de dados (`/data` no Docker) |
 | `GARMIN_EMAIL` / `GARMIN_PASSWORD` | não | Só preenche o form de `/setup` |
 
@@ -111,10 +112,13 @@ Copie de `.env.example`:
 
 ### Opção A — Telegram (uso diário)
 
-1. Mande **oi** ou toque em **Reconectar** / `/login`
-2. Informe e-mail e senha (salvos **só naquele chat**)
-3. Cole o código MFA
-4. Pronto: na próxima reconexão o bot tenta só MFA (com credenciais salvas)
+1. Coloque `GARMIN_EMAIL` e `GARMIN_PASSWORD` no `.env` (mesmo do container)
+2. Seu chat deve estar em `TELEGRAM_ALLOWED_CHAT_IDS`
+3. Mande **oi** ou toque em **Reconectar** / `/login`
+4. Cole o código MFA quando pedir
+5. Pronto: na próxima reconexão o bot usa o `.env` e costuma pedir só MFA
+
+Override opcional: `/creds` salva outro email/senha **só neste chat**.
 
 ### Opção B — Web `/setup`
 

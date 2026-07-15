@@ -28,7 +28,7 @@ from telegram.ext import (
 from app.auth.garmin_auth import GarminAuthError, get_auth
 from app.config import get_settings
 from app.services.workout_flow import draft_workout, execute_workout
-from app.telegram.credentials import get_credential_store
+from app.telegram.credentials import get_credential_store, resolve_garmin_credentials
 from app.telegram.date_parse import parse_date_pt
 
 logger = logging.getLogger(__name__)
@@ -266,7 +266,7 @@ async def _login_with_stored(
     *,
     force: bool = False,
 ) -> int:
-    """Usa email/senha salvos do chat; pede MFA se necessário. Senão, coleta credenciais."""
+    """Usa .env (chat liberado) ou credenciais salvas; pede MFA se necessário."""
     cid = _chat_id(update)
     if cid is None:
         return ConversationHandler.END
@@ -300,20 +300,21 @@ async def _login_with_stored(
         )
         return WAITING_WORKOUT if not auth.needs_login() else ConversationHandler.END
 
-    creds = get_credential_store().get(cid)
+    creds = resolve_garmin_credentials(cid)
     if not creds:
         prefix = f"{reason}\n\n" if reason else ""
         await _reply(
             update,
             f"{prefix}"
-            "Vamos salvar seu login Garmin neste chat "
-            "(depois só peço o código MFA).\n\n"
-            "Qual é o <b>e-mail</b>?",
+            "Não achei login Garmin.\n"
+            "Coloque <b>GARMIN_EMAIL</b> e <b>GARMIN_PASSWORD</b> no <code>.env</code> "
+            "deste app, ou manda o <b>e-mail</b> aqui pra salvar neste chat.",
         )
         return WAITING_EMAIL
 
     prefix = f"{reason}\n\n" if reason else ""
-    await _reply(update, f"{prefix}Reconectando com a conta salva…")
+    origem = "do .env" if creds.source == "env" else "salvo neste chat"
+    await _reply(update, f"{prefix}Reconectando ({origem})…")
     try:
         result = await asyncio.to_thread(auth.start_login, creds.email, creds.password)
     except GarminAuthError as exc:
@@ -326,12 +327,20 @@ async def _login_with_stored(
                 with_menu=True,
             )
             return WAITING_WORKOUT if not get_auth().needs_login() else ConversationHandler.END
-        await _reply(
-            update,
-            f"Não consegui entrar com a conta salva.\n"
-            f"{_esc(str(exc))}\n\n"
-            "Manda o <b>e-mail</b> de novo pra atualizar o login.",
-        )
+        if creds.source == "env":
+            await _reply(
+                update,
+                f"Não consegui entrar com o login do <code>.env</code>.\n"
+                f"{_esc(str(exc))}\n\n"
+                "Confere email/senha no .env, ou manda o <b>e-mail</b> pra sobrescrever neste chat.",
+            )
+        else:
+            await _reply(
+                update,
+                f"Não consegui entrar com a conta salva.\n"
+                f"{_esc(str(exc))}\n\n"
+                "Manda o <b>e-mail</b> de novo pra atualizar o login.",
+            )
         return WAITING_EMAIL
     except Exception as exc:
         logger.exception("stored login failed")
@@ -394,11 +403,15 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def creds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Força cadastrar/atualizar email+senha do chat."""
+    """Override opcional: salva email+senha neste chat (senão usa o .env)."""
     if not _allowed(update):
         await _reply(update, "Esse chat não está liberado.")
         return ConversationHandler.END
-    await _reply(update, "Ok, vamos atualizar o login salvo.\nQual é o <b>e-mail</b>?")
+    await _reply(
+        update,
+        "Por padrão uso o login do <code>.env</code>.\n"
+        "Se quiser um override só neste chat, manda o <b>e-mail</b>.",
+    )
     return WAITING_EMAIL
 
 
@@ -410,7 +423,12 @@ async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if cid is not None:
         get_credential_store().delete(cid)
     get_auth().clear()
-    await _reply(update, "Apaguei a sessão e o login salvo deste chat.")
+    await _reply(
+        update,
+        "Apaguei a sessão Garmin e o override deste chat.\n"
+        "O login do <code>.env</code> continua; use Reconectar quando quiser.",
+        with_menu=True,
+    )
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -418,10 +436,14 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await _reply(update, "Esse chat não está liberado.")
         return
     cid = _chat_id(update)
-    has_creds = bool(cid and get_credential_store().get(cid))
+    creds = resolve_garmin_credentials(cid) if cid else None
     st = get_auth().status()
     if st["authenticated"]:
-        extra = " Login salvo neste chat." if has_creds else ""
+        extra = ""
+        if creds and creds.source == "env":
+            extra = " Login via .env."
+        elif creds and creds.source == "chat":
+            extra = " Login override neste chat."
         await _reply(
             update,
             f"Tudo certo — Garmin conectado.{extra}",
@@ -429,10 +451,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
     else:
         msg = "Garmin desconectado."
-        if has_creds:
+        if creds and creds.source == "env":
+            msg += " Posso reconectar com o .env (só peço MFA)."
+        elif creds:
             msg += " Posso reconectar pedindo só o MFA."
         else:
-            msg += " Ainda não tem login salvo neste chat."
+            msg += " Falta GARMIN_EMAIL/PASSWORD no .env."
         await _reply(update, msg, reply_markup=_reconnect_keyboard())
 
 
