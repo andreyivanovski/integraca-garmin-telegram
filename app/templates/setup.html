@@ -67,7 +67,7 @@
   <form class="card" method="post" action="/setup/device">
     <h3>Device padrão</h3>
     <label>deviceId</label>
-    <input name="device_id" type="number" value="{{ status.device_id or 3614157799 }}" required />
+    <input name="device_id" type="number" value="{{ status.device_id or '' }}" placeholder="ex.: do Connect / /api status" required />
     <button type="submit">Salvar device</button>
   </form>
 </body>

@@ -129,7 +129,7 @@ class GarminAuth:
 
     def save(self, tokens: TokenStore) -> None:
         self.settings.data_dir.mkdir(parents=True, exist_ok=True)
-        if tokens.device_id is None:
+        if tokens.device_id is None and self.settings.default_device_id:
             tokens.device_id = self.settings.default_device_id
         self.tokens_path.write_text(json.dumps(tokens.to_dict(), indent=2), encoding="utf-8")
         self._tokens = tokens
@@ -143,7 +143,7 @@ class GarminAuth:
         return {
             "authenticated": self.is_authenticated,
             "email": t.email if t else None,
-            "device_id": t.device_id if t else self.settings.default_device_id,
+            "device_id": (t.device_id if t else None) or self.settings.default_device_id,
             "has_refresh": bool(t and t.refresh_token),
         }
 
@@ -155,7 +155,12 @@ class GarminAuth:
     def get_device_id(self) -> int:
         if self._tokens and self._tokens.device_id:
             return self._tokens.device_id
-        return self.settings.default_device_id
+        if self.settings.default_device_id:
+            return self.settings.default_device_id
+        raise GarminAuthError(
+            "Device não configurado. Defina DEFAULT_DEVICE_ID no .env "
+            "ou salve o deviceId em /setup."
+        )
 
     def set_device_id(self, device_id: int) -> None:
         if not self._tokens:

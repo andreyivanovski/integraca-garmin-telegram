@@ -99,7 +99,7 @@ Copie de `.env.example`:
 | `GROQ_MODEL` | não | Default `llama-3.3-70b-versatile` |
 | `TELEGRAM_BOT_TOKEN` | sim* | Token do BotFather (*sem token o bot não sobe) |
 | `TELEGRAM_ALLOWED_CHAT_IDS` | sim* | IDs liberados, separados por vírgula |
-| `DEFAULT_DEVICE_ID` | recomendado | ID do relógio no Connect (ex.: Fenix) |
+| `DEFAULT_DEVICE_ID` | recomendado | ID do seu relógio no Garmin Connect |
 | `DATA_DIR` | não | Pasta de dados (`/data` no Docker) |
 | `GARMIN_EMAIL` / `GARMIN_PASSWORD` | não | Só preenche o form de `/setup` |
 
@@ -189,7 +189,7 @@ Content-Type: application/json
 {
   "workout_body": { ... },
   "date": "2026-07-20",
-  "device_id": 3614157799
+  "device_id": 1234567890
 }
 ```
 
@@ -247,7 +247,7 @@ Dockerfile
 3. **Warm-up / cool-down** só entram se o texto pedir.
 4. **Recovery padrão** entre reps: volta (`lap.button`), salvo se o texto especificar outra pausa.
 5. **Cloudflare / CAPTCHA** no portal web: o fluxo oficial do app usa a API **mobile** (`GCM_ANDROID_DARK`).
-6. Relógio padrão configurável via `DEFAULT_DEVICE_ID` (ex.: Fenix 8).
+6. Relógio: configure `DEFAULT_DEVICE_ID` no `.env` ou salve em `/setup` (cada pessoa usa o ID do próprio device).
 
 ---
 
