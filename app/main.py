@@ -20,6 +20,10 @@ from app.telegram.date_parse import parse_date_pt
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+# Evita spam de stacktrace a cada Conflict/retry do Telegram
+logging.getLogger("telegram.ext.Updater").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.Application").setLevel(logging.WARNING)
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -43,7 +47,9 @@ async def lifespan(app: FastAPI):
     yield
     if _bot_app is not None:
         try:
-            await _bot_app.updater.stop()
+            updater = getattr(_bot_app, "updater", None)
+            if updater is not None and getattr(updater, "running", False):
+                await updater.stop()
             await _bot_app.stop()
             await _bot_app.shutdown()
         except Exception:

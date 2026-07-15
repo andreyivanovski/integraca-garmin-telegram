@@ -266,6 +266,20 @@ Projeto pessoal de integração com APIs não oficiais / reverse-engineered do G
 
 ---
 
+## Custo / consumo (container pago)
+
+O que mais consome com o app **ocioso**:
+
+1. **Telegram polling** — o bot fica fazendo `getUpdates` o tempo todo.
+2. **Duas instâncias do mesmo bot** — gera `Conflict` e retry em loop. Só 1 réplica; pare o Docker local se o bot estiver na nuvem.
+3. **Healthcheck muito frequente** — no painel do host, use intervalo ≥ 30–60s.
+
+Para uso raro (~1x/dia), a forma mais barata sem mudar o app: **ligar o container só na hora** e desligar depois.
+
+O que **não** gasta parado: Groq, login Garmin, criar treino (só sob demanda).
+
+---
+
 ## Atalhos úteis
 
 ```bash

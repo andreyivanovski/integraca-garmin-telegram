@@ -825,7 +825,31 @@ def build_application() -> Application | None:
 
 
 async def run_bot_polling(application: Application) -> None:
+    """Long-poll com timeout alto = menos requests/CPU quando ocioso."""
+    from telegram.error import Conflict, NetworkError, TimedOut
+
+    async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        err = context.error
+        if isinstance(err, Conflict):
+            logger.error(
+                "Conflict: outra instância está fazendo getUpdates com este token. "
+                "Deixe só 1 container/réplica rodando. Aguardando 90s…"
+            )
+            await asyncio.sleep(90)
+            return
+        if isinstance(err, (TimedOut, NetworkError)):
+            logger.warning("Telegram rede: %s", err)
+            return
+        logger.exception("Erro no bot Telegram: %s", err)
+
+    application.add_error_handler(_on_error)
     await application.initialize()
+    await application.bot.delete_webhook(drop_pending_updates=True)
     await application.start()
-    await application.updater.start_polling(drop_pending_updates=True)
-    logger.info("Telegram bot polling started")
+    await application.updater.start_polling(
+        drop_pending_updates=True,
+        poll_interval=1.0,
+        timeout=50,
+        bootstrap_retries=-1,
+    )
+    logger.info("Telegram bot polling started (timeout=50s)")

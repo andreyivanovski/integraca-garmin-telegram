@@ -17,6 +17,10 @@ class GarminClient:
     def __init__(self, auth: GarminAuth | None = None) -> None:
         self.auth = auth or get_auth()
         self.settings = get_settings()
+        self._http = httpx.Client(timeout=60.0)
+
+    def close(self) -> None:
+        self._http.close()
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -31,14 +35,14 @@ class GarminClient:
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = f"{self.settings.garmin_connectapi}/{path.lstrip('/')}"
         last_exc: Exception | None = None
+        r: httpx.Response | None = None
 
         for attempt in range(1, 4):
             try:
-                with httpx.Client(timeout=60.0) as client:
-                    r = client.request(method, url, headers=self._headers(), **kwargs)
-                    if r.status_code == 401:
-                        self.auth.refresh()
-                        r = client.request(method, url, headers=self._headers(), **kwargs)
+                r = self._http.request(method, url, headers=self._headers(), **kwargs)
+                if r.status_code == 401:
+                    self.auth.refresh()
+                    r = self._http.request(method, url, headers=self._headers(), **kwargs)
                 last_exc = None
                 break
             except GarminAuthError:
@@ -57,6 +61,7 @@ class GarminClient:
         else:
             raise GarminClientError(str(last_exc) if last_exc else "request failed")
 
+        assert r is not None
         if r.status_code >= 400:
             raise GarminClientError(f"{method} {path} → {r.status_code}: {r.text[:500]}")
         if r.status_code == 204 or not r.content:
@@ -101,5 +106,11 @@ class GarminClient:
         return self._request("POST", "/device-service/devicemessage/messages", json=payload)
 
 
+_client: GarminClient | None = None
+
+
 def get_client() -> GarminClient:
-    return GarminClient()
+    global _client
+    if _client is None:
+        _client = GarminClient()
+    return _client
