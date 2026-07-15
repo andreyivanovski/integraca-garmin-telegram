@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Garmin — teste</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #1a1a1a; background: #f6f6f4; }
+    body { max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+    a { color: #0b5; }
+    .card { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+    label { display: block; margin: .5rem 0 .25rem; font-weight: 600; }
+    input, textarea { width: 100%; padding: .5rem; box-sizing: border-box; }
+    button { margin-top: .75rem; padding: .55rem 1rem; background: #111; color: #fff; border: 0; border-radius: 6px; cursor: pointer; }
+    .ok { color: #0a7; } .err { color: #c00; white-space: pre-wrap; }
+    pre { background: #f0f0ec; padding: .75rem; overflow: auto; font-size: .85rem; }
+  </style>
+</head>
+<body>
+  <h1>Teste — treino → Garmin</h1>
+  <p><a href="/setup">Setup / MFA</a> · uso real via Telegram</p>
+
+  <div class="card">
+    <strong>Garmin:</strong>
+    {% if status.authenticated %}
+      <span class="ok">conectado</span> ({{ status.email }}) · device {{ status.device_id }}
+    {% else %}
+      <span class="err">não autenticado</span> — faça <a href="/setup">setup</a>
+    {% endif %}
+  </div>
+
+  <form class="card" method="post" action="/test/run">
+    <label>Descrição do treino</label>
+    <textarea name="text" rows="3" required placeholder="10 vezes de 300 mt">{{ text or '' }}</textarea>
+    <label>Dia (amanha / sexta / 2026-07-20)</label>
+    <input name="date" value="{{ date or 'amanha' }}" required />
+    <button type="submit">Draft Groq + criar + agendar + enviar</button>
+  </form>
+
+  {% if error %}<div class="card err">{{ error }}</div>{% endif %}
+  {% if draft %}<div class="card"><h3>Rascunho</h3><pre>{{ draft }}</pre></div>{% endif %}
+  {% if result %}<div class="card"><h3>Resultado</h3><pre>{{ result }}</pre></div>{% endif %}
+</body>
+</html>

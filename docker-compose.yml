@@ -1,0 +1,19 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    volumes:
+      - garmin_data:/data
+      - ./app:/app/app
+    restart: unless-stopped
+
+volumes:
+  garmin_data:

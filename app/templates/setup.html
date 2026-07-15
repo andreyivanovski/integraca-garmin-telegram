@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Setup Garmin</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #1a1a1a; background: #f6f6f4; }
+    body { max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+    a { color: #0b5; }
+    .card { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+    label { display: block; margin: .5rem 0 .25rem; font-weight: 600; }
+    input { width: 100%; padding: .5rem; box-sizing: border-box; }
+    button { margin-top: .75rem; padding: .55rem 1rem; background: #111; color: #fff; border: 0; border-radius: 6px; cursor: pointer; }
+    .ok { color: #0a7; } .err { color: #c00; white-space: pre-wrap; }
+    small { color: #666; }
+    .recom { border-color: #0a7; }
+  </style>
+</head>
+<body>
+  <h1>Setup Garmin (uma vez)</h1>
+  <p><a href="/">← teste</a></p>
+
+  <div class="card">
+    {% if status.authenticated %}
+      <p class="ok">Conectado como {{ status.email }} · device {{ status.device_id }} · refresh={{ status.has_refresh }}</p>
+    {% else %}
+      <p class="err">Não autenticado</p>
+    {% endif %}
+  </div>
+
+  {% if message %}<div class="card {% if mfa_required %}ok{% else %}err{% endif %}">{{ message }}</div>{% endif %}
+
+  {% if mfa_required %}
+  <form class="card recom" method="post" action="/setup/mfa">
+    <h3>Código MFA (e-mail)</h3>
+    <label>Código</label>
+    <input name="code" required autocomplete="one-time-code" autofocus />
+    <button type="submit">Confirmar MFA</button>
+  </form>
+  {% else %}
+  <form class="card recom" method="post" action="/setup/login">
+    <h3>Login (mobile SSO — sem CAPTCHA)</h3>
+    <label>Email</label>
+    <input name="email" type="email" value="{{ default_email }}" required />
+    <label>Senha</label>
+    <input name="password" type="password" required />
+    <button type="submit">Entrar</button>
+    <p><small>Usa a API mobile do Garmin. Depois pede MFA do e-mail e grava o refresh token.</small></p>
+  </form>
+  {% endif %}
+
+  <form class="card" method="post" action="/setup/ticket">
+    <h3>Ticket ST- (avançado)</h3>
+    <p><small>
+      Ticket da <b>URL do browser já foi usado</b> e falha com “invalid service ticket”.
+      Só funciona se você colar um <code>serviceTicketId</code> fresco (resposta do MFA no Network),
+      antes do redirect. Prefira o login acima.
+    </small></p>
+    <label>Ticket ST-... ou serviceTicketId</label>
+    <input name="ticket" required placeholder="ST-...." />
+    <label>Email (opcional)</label>
+    <input name="email" value="{{ default_email }}" />
+    <button type="submit">Trocar ticket</button>
+  </form>
+
+  <form class="card" method="post" action="/setup/device">
+    <h3>Device padrão</h3>
+    <label>deviceId</label>
+    <input name="device_id" type="number" value="{{ status.device_id or 3614157799 }}" required />
+    <button type="submit">Salvar device</button>
+  </form>
+</body>
+</html>

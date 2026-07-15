@@ -1,0 +1,13 @@
+.dockerignore
+*.har
+.git
+.venv
+venv
+data
+.env
+__pycache__
+*.pyc
+Garmin_Connect.postman*
+README_POSTMAN.md
+garmin_auth_bootstrap.py
+.connect.garmin.com.har
