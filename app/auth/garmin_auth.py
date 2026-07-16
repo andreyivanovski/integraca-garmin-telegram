@@ -398,33 +398,55 @@ class GarminAuth:
     def needs_login(self) -> bool:
         return not self.is_authenticated
 
-    def refresh(self) -> TokenStore:
+    def try_refresh(self) -> bool:
+        """Tenta renovar access token. Não apaga sessão em erro de rede/5xx."""
         if not self._tokens or not self._tokens.refresh_token:
-            self.clear()
-            raise GarminAuthError("Sessão expirada. Conecte de novo pelo Telegram (/login).")
+            return False
+        try:
+            self.refresh(clear_on_fail=False)
+            return True
+        except GarminAuthError:
+            return False
+
+    def refresh(self, *, clear_on_fail: bool = True) -> TokenStore:
+        if not self._tokens or not self._tokens.refresh_token:
+            if clear_on_fail:
+                self.clear()
+            raise GarminAuthError("Sessão expirada. Espere o 429 passar e use /login uma vez.")
         client_id = self._tokens.di_client_id
-        r = requests.post(
-            f"{self.settings.garmin_diauth}/di-oauth2-service/oauth/token",
-            impersonate=IMPERSONATE,
-            headers={
-                "Authorization": _basic_auth(client_id),
-                "Accept": "application/json",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": "GCM-Android-5.23",
-            },
-            data={
-                "client_id": client_id,
-                "grant_type": "refresh_token",
-                "refresh_token": self._tokens.refresh_token,
-            },
-            timeout=60,
-        )
-        if not r.ok:
-            self.clear()
-            raise GarminAuthError(
-                "Sessão Garmin expirou ou foi revogada. "
-                "Conecte de novo pelo Telegram com /login."
+        try:
+            r = requests.post(
+                f"{self.settings.garmin_diauth}/di-oauth2-service/oauth/token",
+                impersonate=IMPERSONATE,
+                headers={
+                    "Authorization": _basic_auth(client_id),
+                    "Accept": "application/json",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": "GCM-Android-5.23",
+                },
+                data={
+                    "client_id": client_id,
+                    "grant_type": "refresh_token",
+                    "refresh_token": self._tokens.refresh_token,
+                },
+                timeout=60,
             )
+        except Exception as exc:
+            # Rede/DNS — mantém tokens no disco
+            raise GarminAuthError(f"Falha de rede ao renovar sessão: {exc}") from exc
+
+        if not r.ok:
+            body = (r.text or "").lower()
+            # Só limpa se a Garmin rejeitou o refresh de verdade
+            definitive = r.status_code in (400, 401) or "invalid" in body or "revoked" in body
+            if definitive and clear_on_fail:
+                self.clear()
+                raise GarminAuthError(
+                    "Sessão Garmin expirada ou revogada. "
+                    "Quando o 429 passar, use /login uma vez (não fique apertando)."
+                )
+            raise GarminAuthError(f"Refresh falhou ({r.status_code}). Tokens mantidos — tente depois.")
+
         tok = r.json()
         self._tokens.access_token = tok["access_token"]
         if tok.get("refresh_token"):
