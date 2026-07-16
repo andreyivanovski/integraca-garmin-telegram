@@ -37,10 +37,11 @@ logger = logging.getLogger(__name__)
     WAITING_EMAIL,
     WAITING_PASSWORD,
     WAITING_MFA,
+    WAITING_TICKET,
     WAITING_WORKOUT,
     WAITING_DATE,
     WAITING_CONFIRM,
-) = range(6)
+) = range(7)
 
 CB_DATE_TODAY = "date:today"
 CB_DATE_TOMORROW = "date:tomorrow"
@@ -48,6 +49,7 @@ CB_CONFIRM_YES = "confirm:yes"
 CB_CONFIRM_NO = "confirm:no"
 CB_LOGIN_START = "login:start"
 CB_LOGIN_FORCE = "login:force"
+CB_LOGIN_TICKET = "login:ticket"
 
 BTN_NEW = "Novo treino"
 BTN_STATUS = "Status"
@@ -255,8 +257,44 @@ def _force_login_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _ticket_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Colar ticket do browser", callback_data=CB_LOGIN_TICKET)]]
+    )
+
+
+def _looks_like_ticket(text: str) -> bool:
+    t = (text or "").strip()
+    return bool(
+        t.startswith("ST-")
+        or "ticket=" in t.lower()
+        or "serviceticket" in t.lower()
+    )
+
+
 def _is_rate_limit_error(exc: Exception) -> bool:
     return "429" in str(exc)
+
+
+_TICKET_HELP = (
+    "O login automático (API mobile) está em 429, mas o <b>browser</b> é outro caminho.\n\n"
+    "1. Abra o Connect no navegador e faça login\n"
+    "2. No DevTools → Network, ache a resposta com <code>serviceTicketId</code> "
+    "(ST-...) <b>antes</b> do redirect consumir\n"
+    "   ou cole a URL com <code>ticket=ST-...</code> se ainda não abriu\n"
+    "3. Manda o <code>ST-...</code> (ou a URL) aqui\n\n"
+    "Também funciona: /ticket"
+)
+
+
+async def _ask_ticket(update: Update, reason: str = "") -> int:
+    prefix = f"{reason}\n\n" if reason else ""
+    await _reply(
+        update,
+        f"{prefix}{_TICKET_HELP}",
+        reply_markup=_ticket_keyboard(),
+    )
+    return WAITING_TICKET
 
 
 async def _login_with_stored(
@@ -289,16 +327,19 @@ async def _login_with_stored(
     cooldown = auth.login_cooldown_seconds()
     if cooldown > 0:
         mins = max(1, (cooldown + 59) // 60)
-        hint = ""
         if not auth.needs_login():
-            hint = "\n\nA sessão atual ainda serve — manda o treino normalmente."
-        await _reply(
+            await _reply(
+                update,
+                f"Login automático em cooldown (~{mins} min), mas a sessão "
+                "atual ainda serve — manda o treino.",
+                with_menu=True,
+            )
+            return WAITING_WORKOUT
+        return await _ask_ticket(
             update,
-            f"Garmin bloqueou login por tentativas demais (429).\n"
-            f"Espera ~<b>{mins} min</b> e tenta de novo.{hint}",
-            with_menu=True,
+            f"API mobile em 429 (~{mins} min). Como o browser funciona, "
+            "use o ticket ST-…",
         )
-        return WAITING_WORKOUT if not auth.needs_login() else ConversationHandler.END
 
     creds = resolve_garmin_credentials(cid)
     if not creds:
@@ -308,7 +349,8 @@ async def _login_with_stored(
             f"{prefix}"
             "Não achei login Garmin.\n"
             "Coloque <b>GARMIN_EMAIL</b> e <b>GARMIN_PASSWORD</b> no <code>.env</code> "
-            "deste app, ou manda o <b>e-mail</b> aqui pra salvar neste chat.",
+            "deste app, ou manda o <b>e-mail</b> aqui pra salvar neste chat.\n\n"
+            "Com 429 no mobile, também pode /ticket.",
         )
         return WAITING_EMAIL
 
@@ -319,27 +361,20 @@ async def _login_with_stored(
         result = await asyncio.to_thread(auth.start_login, creds.email, creds.password)
     except GarminAuthError as exc:
         if _is_rate_limit_error(exc):
-            await _reply(
-                update,
-                f"{_esc(str(exc))}\n\n"
-                "Não fica tentando agora — piora o bloqueio.\n"
-                "Se Status mostrar conectado, manda o treino direto.",
-                with_menu=True,
-            )
-            return WAITING_WORKOUT if not get_auth().needs_login() else ConversationHandler.END
+            return await _ask_ticket(update, _esc(str(exc)))
         if creds.source == "env":
             await _reply(
                 update,
                 f"Não consegui entrar com o login do <code>.env</code>.\n"
                 f"{_esc(str(exc))}\n\n"
-                "Confere email/senha no .env, ou manda o <b>e-mail</b> pra sobrescrever neste chat.",
+                "Confere email/senha no .env, manda o <b>e-mail</b>, ou /ticket.",
             )
         else:
             await _reply(
                 update,
                 f"Não consegui entrar com a conta salva.\n"
                 f"{_esc(str(exc))}\n\n"
-                "Manda o <b>e-mail</b> de novo pra atualizar o login.",
+                "Manda o <b>e-mail</b> de novo, ou /ticket.",
             )
         return WAITING_EMAIL
     except Exception as exc:
@@ -374,12 +409,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def entry_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entrada sem /start: oi, botões do menu, ou já o texto do treino."""
+    """Entrada sem /start: oi, botões do menu, ticket, ou já o texto do treino."""
     if not _allowed(update):
         await _reply(update, "Esse chat não está liberado.")
         return ConversationHandler.END
 
     text = (update.message.text or "").strip()
+    if _looks_like_ticket(text):
+        return await receive_ticket(update, context)
     if _is_menu_status(text):
         await status_cmd(update, context)
         return WAITING_WORKOUT if not get_auth().needs_login() else ConversationHandler.END
@@ -392,6 +429,44 @@ async def entry_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Qualquer outra mensagem: assume treino
     context.user_data.clear()
     return await receive_workout(update, context)
+
+
+async def ticket_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Bypass do 429: cola ST-... do browser."""
+    if not _allowed(update):
+        await _reply(update, "Esse chat não está liberado.")
+        return ConversationHandler.END
+    return await _ask_ticket(update)
+
+
+async def receive_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _allowed(update):
+        return ConversationHandler.END
+    text = (update.message.text or "").strip()
+    if not text or text.startswith("/"):
+        return await _ask_ticket(update, "Manda o ST-... ou a URL com ticket=.")
+
+    if _is_greeting(text) or _is_menu_new(text):
+        return await _welcome(update, context)
+
+    settings = get_settings()
+    email = (settings.garmin_email or "").strip() or None
+    await _reply(update, "Trocando o ticket por token…")
+    try:
+        await asyncio.to_thread(get_auth().login_with_ticket, text, email)
+    except GarminAuthError as exc:
+        await _reply(
+            update,
+            f"Ticket não rolou: {_esc(str(exc))}\n\n"
+            "Pega um ST- fresco no Network (antes do redirect) e manda de novo.",
+        )
+        return WAITING_TICKET
+    except Exception as exc:
+        logger.exception("ticket login failed")
+        await _reply(update, f"Falhou: {_esc(str(exc)[:160])}")
+        return WAITING_TICKET
+
+    return await _after_auth_ok(update, context)
 
 
 async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -472,13 +547,16 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def login_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    force = bool(query and query.data == CB_LOGIN_FORCE)
+    data = query.data if query else ""
     if query:
         await query.answer()
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
+    if data == CB_LOGIN_TICKET:
+        return await _ask_ticket(update)
+    force = data == CB_LOGIN_FORCE
     return await _login_with_stored(update, context, force=force)
 
 
@@ -521,11 +599,9 @@ async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         mins = max(1, (cooldown + 59) // 60)
         await _reply(
             update,
-            f"Login salvo, mas a Garmin ainda está em cooldown (~{mins} min).\n"
-            "Depois toca em <b>Reconectar</b> — sem ficar tentando agora.",
-            with_menu=True,
+            f"Login salvo, mas a API mobile ainda está em cooldown (~{mins} min).",
         )
-        return WAITING_WORKOUT if not auth.needs_login() else ConversationHandler.END
+        return await _ask_ticket(update)
 
     await _reply(update, "Login salvo. Entrando na Garmin…")
 
@@ -533,13 +609,7 @@ async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         result = await asyncio.to_thread(auth.start_login, email, password)
     except GarminAuthError as exc:
         if _is_rate_limit_error(exc):
-            await _reply(
-                update,
-                f"{_esc(str(exc))}\n\n"
-                "Login ficou salvo. Espera o cooldown e toca Reconectar.",
-                with_menu=True,
-            )
-            return WAITING_WORKOUT if not get_auth().needs_login() else ConversationHandler.END
+            return await _ask_ticket(update, _esc(str(exc)))
         await _reply(
             update,
             f"Não consegui entrar: {_esc(str(exc))}\n\nManda o e-mail de novo.",
@@ -562,6 +632,8 @@ async def receive_mfa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return ConversationHandler.END
     code = (update.message.text or "").strip()
     await _try_delete(update)
+    if _looks_like_ticket(code):
+        return await receive_ticket(update, context)
     if not code:
         await _reply(update, "Manda o código MFA.")
         return WAITING_MFA
@@ -589,6 +661,8 @@ async def receive_workout(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return ConversationHandler.END
 
     text = (update.message.text or "").strip()
+    if _looks_like_ticket(text):
+        return await receive_ticket(update, context)
     if not text or text.startswith("/"):
         await _reply(update, "Manda o treino, tipo: <b>10x150m</b>", with_menu=True)
         return WAITING_WORKOUT
@@ -798,8 +872,9 @@ def build_application() -> Application | None:
             CommandHandler("start", start),
             CommandHandler("treino", start),
             CommandHandler("login", login_cmd),
+            CommandHandler("ticket", ticket_cmd),
             CommandHandler("creds", creds_cmd),
-            CallbackQueryHandler(login_start_button, pattern=r"^login:(start|force)$"),
+            CallbackQueryHandler(login_start_button, pattern=r"^login:(start|force|ticket)$"),
             # Qualquer texto inicia: oi, botões, ou já o treino
             MessageHandler(filters.TEXT & ~filters.COMMAND, entry_any_text),
         ],
@@ -812,6 +887,9 @@ def build_application() -> Application | None:
             ],
             WAITING_MFA: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_mfa),
+            ],
+            WAITING_TICKET: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_ticket),
             ],
             WAITING_WORKOUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_workout),

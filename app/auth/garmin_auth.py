@@ -168,6 +168,9 @@ class GarminAuth:
         self._tokens.device_id = device_id
         self.save(self._tokens)
 
+    def clear_login_cooldown(self) -> None:
+        _clear_rate_limit(self.settings)
+
     def login_cooldown_seconds(self) -> int:
         """Segundos restantes do bloqueio pós-429 (0 = liberado)."""
         until = _load_rate_limited_until(self.settings)
@@ -317,6 +320,7 @@ class GarminAuth:
         tokens = self._exchange_ticket(ticket, email=email, service_url=service_url)
         self.save(tokens)
         _pending.clear()
+        _clear_rate_limit(self.settings)
         return {"status": "ok", **self.status()}
 
     def login_with_ticket(self, ticket: str, email: str | None = None) -> dict[str, Any]:
@@ -330,14 +334,15 @@ class GarminAuth:
             try:
                 tokens = self._exchange_ticket(ticket, email=email, service_url=service_url)
                 self.save(tokens)
+                _clear_rate_limit(self.settings)
                 return {"status": "ok", **self.status()}
             except GarminAuthError as exc:
                 last_err = str(exc)
                 continue
         raise GarminAuthError(
             f"{last_err} — Ticket da URL do browser já foi CONSUMIDO "
-            "(one-time). Prefira Login automático + MFA nesta página "
-            "(fluxo mobile, sem CAPTCHA)."
+            "(one-time). Pegue o serviceTicketId no Network ANTES do redirect, "
+            "ou espere o 429 passar e use /login de novo."
         )
 
     def _exchange_ticket(
