@@ -46,7 +46,7 @@ PACE_SINGLE_RE = re.compile(
 )
 
 # aquecimento|desaquecimento|recuperação + tempo/distância/relógio
-# Exemplos: "aquecimento 10 min", "desaquec 1km", "pausa 90s", "recuperação 01:30", "recovery 200m"
+# Exemplos: "aquecimento 10 min", "2,5km Aquecimento", "pausa 90s", "intervalo parado de 1:30"
 _PHASE_QTY = (
     r"(?:de\s*|com\s*|em\s*|por\s*)?"
     r"(?:"
@@ -61,12 +61,47 @@ WARMUP_PHASE_RE = re.compile(
     rf"(?:(?<!des)aquec\w*|warmup|warm[\s-]?up)\s*{_PHASE_QTY}",
     re.IGNORECASE,
 )
+WARMUP_QTY_BEFORE_RE = re.compile(
+    rf"(?P<val>\d+(?:[.,]\d+)?)\s*(?P<unit>km|m|mt|metros)\s+"
+    rf"(?:(?<!des)aquec\w*|warmup|warm[\s-]?up)",
+    re.IGNORECASE,
+)
 COOLDOWN_PHASE_RE = re.compile(
     rf"(?:desaquec\w*|cooldown|cool[\s-]?down|volta(?:r)?\s+a\s*calma)\s*{_PHASE_QTY}",
     re.IGNORECASE,
 )
-RECOVERY_PHASE_RE = re.compile(
-    rf"(?:recupera(?:ção|cao|\w*)|recovery|pausa|descans\w*|repouso|entre\s+(?:elas|eles|tiros|séries|series))\s*{_PHASE_QTY}",
+COOLDOWN_QTY_BEFORE_RE = re.compile(
+    rf"(?P<val>\d+(?:[.,]\d+)?)\s*(?P<unit>km|m|mt|metros)\s+"
+    rf"(?:desaquec\w*|cooldown|cool[\s-]?down|volta(?:r)?\s+a\s*calma)",
+    re.IGNORECASE,
+)
+
+# Recuperação ENTRE as reps (prioridade alta)
+INTER_RECOVERY_RE = re.compile(
+    rf"(?:"
+    rf"intervalo\s+parado|"
+    rf"recupera(?:ção|cao|\w*)\s+entre|"
+    rf"pausa\s+entre|"
+    rf"entre\s+(?:elas|eles|tiros|séries|series|reps?)"
+    rf")\s*{_PHASE_QTY}",
+    re.IGNORECASE,
+)
+
+# Descanso isolado (ex.: após aquecimento, ANTES dos tiros) — NÃO é recovery do repeat
+PRE_REST_RE = re.compile(
+    rf"(?:descanso\s+parado|descans\w+|repouso)\s*{_PHASE_QTY}",
+    re.IGNORECASE,
+)
+
+# Fallback genérico de recovery só se não houver inter-recovery
+RECOVERY_FALLBACK_RE = re.compile(
+    rf"(?:recupera(?:ção|cao|\w*)|recovery|pausa)\s*{_PHASE_QTY}",
+    re.IGNORECASE,
+)
+
+# 400> 1:28/32  ou  1:28/32  (minutos do segundo relógio implícitos)
+LAP_SLASH_PACE_RE = re.compile(
+    r"(?:(?P<dist>\d+)\s*m?\s*>\s*)?(?P<a>\d{1,2}:\d{2})\s*/\s*(?P<b>\d{2})\b",
     re.IGNORECASE,
 )
 
@@ -84,6 +119,9 @@ Responda APENAS JSON (sem markdown) neste schema:
   "recovery_mode": "lap"|"time"|"distance",
   "recovery_seconds": number|null,
   "recovery_meters": number|null,
+  "pre_repeat_rest_mode": "none"|"time"|"distance",
+  "pre_repeat_rest_seconds": number|null,
+  "pre_repeat_rest_meters": number|null,
   "warmup": bool,
   "warmup_mode": "lap"|"time"|"distance",
   "warmup_seconds": number|null,
@@ -95,19 +133,15 @@ Responda APENAS JSON (sem markdown) neste schema:
 }
 
 REGRAS (obrigatórias):
-1) "10x400" / "10 X 400" → reps=10, interval_meters=400
-2) Distância do intervalo em METROS (km → *1000). Tempo do intervalo em SEGUNDOS.
-3) Ritmo "01:06 a 01:20" junto de um intervalo em metros (ex 400) → pace_mode="lap_time"
-   (tempo para percorrer ESSA distância). NÃO trate como min/km.
-4) Ritmo "5:00/km" ou "5:00 a 5:30 por km" → pace_mode="per_km"
-5) Se só um relógio (ex ritmo 5:00/km) → pace_fast_clock=pace_slow_clock
-6) Recovery / aquecimento / desaquecimento:
-   - Se pedir tempo (90s, 2 min, 01:30) → mode="time" e seconds
-   - Se pedir distância (200m, 1km) → mode="distance" e meters
-   - Só use mode="lap" (botão) se NÃO houver tempo nem distância
-7) warmup/cooldown = true SÓ se o texto pedir; preencha warmup_*/cooldown_* quando houver quantidade
-8) sport sempre corrida — não invente outros esportes
-9) Nunca truncar nomes; clocks sempre "M:SS" ou "MM:SS"
+1) "10x400" / "10x 400" → reps=10, interval_meters=400
+2) Distância em METROS (2,5km → 2500). Tempo em SEGUNDOS.
+3) "2,5km Aquecimento" / "Aquecimento 2,5km" → warmup distance 2500
+4) "Descanso parado de 3min" DEPOIS do aquecimento e ANTES dos tiros → pre_repeat_rest_* (NÃO recovery)
+5) "intervalo parado de 1:30" / recuperação entre tiros → recovery_* do Repeat
+6) "400> 1:28/32" → pace_mode=lap_time, clocks 1:28 e 1:32
+7) Ritmo "5:00/km" → pace_mode=per_km
+8) warmup/cooldown = true só se o texto pedir
+9) sport sempre corrida
 """
 
 
@@ -130,6 +164,10 @@ class WorkoutIntent(BaseModel):
     cooldown_mode: str = "lap"
     cooldown_seconds: float | None = None
     cooldown_meters: float | None = None
+    # Descanso isolado entre aquecimento e o bloco de tiros
+    pre_repeat_rest_mode: str = "none"  # none | time | distance
+    pre_repeat_rest_seconds: float | None = None
+    pre_repeat_rest_meters: float | None = None
 
     @field_validator("pace_mode", mode="before")
     @classmethod
@@ -143,14 +181,24 @@ class WorkoutIntent(BaseModel):
             return "none"
         return v if v in {"none", "lap_time", "per_km"} else "none"
 
-    @field_validator("recovery_mode", "warmup_mode", "cooldown_mode", mode="before")
+    @field_validator(
+        "recovery_mode",
+        "warmup_mode",
+        "cooldown_mode",
+        "pre_repeat_rest_mode",
+        mode="before",
+    )
     @classmethod
     def _end_mode(cls, v: Any) -> str:
         v = (str(v) if v is not None else "lap").lower().strip()
+        if v in {"none", "", "null", "no"}:
+            return "none"
         if v in {"time", "tempo", "seconds", "segundos"}:
             return "time"
         if v in {"distance", "distancia", "metros", "m"}:
             return "distance"
+        if v == "none":
+            return "none"
         return "lap"
 
 
@@ -192,17 +240,18 @@ def _wants_cooldown(text: str) -> bool:
 def _qty_match_to_phase(m: re.Match[str] | None) -> PhaseEnd | None:
     if not m:
         return None
-    clock = m.groupdict().get("clock")
+    g = m.groupdict()
+    clock = g.get("clock")
     if clock:
         try:
             return PhaseEnd(mode="time", seconds=_clock_to_seconds(clock))
         except ValueError:
             return None
-    raw_val = m.groupdict().get("val")
+    raw_val = g.get("val")
     if raw_val is None:
         return None
     val = float(str(raw_val).replace(",", "."))
-    unit = (m.groupdict().get("unit") or "").lower().strip()
+    unit = (g.get("unit") or "").lower().strip()
     if unit.startswith("min") or unit.startswith("hora") or unit == "h":
         mult = 3600 if unit.startswith("hora") or unit == "h" else 60
         return PhaseEnd(mode="time", seconds=val * mult)
@@ -211,7 +260,6 @@ def _qty_match_to_phase(m: re.Match[str] | None) -> PhaseEnd | None:
     if unit in {"m", "mt", "metros"}:
         return PhaseEnd(mode="distance", meters=val)
     if unit.startswith("s") or unit.startswith("seg") or unit == "":
-        # sem unidade: se valor grande (>=100) assume metros; senão segundos
         if not unit and val >= 100:
             return PhaseEnd(mode="distance", meters=val)
         return PhaseEnd(mode="time", seconds=val)
@@ -219,42 +267,101 @@ def _qty_match_to_phase(m: re.Match[str] | None) -> PhaseEnd | None:
 
 
 def _parse_warmup_phase(text: str) -> PhaseEnd | None:
-    return _qty_match_to_phase(WARMUP_PHASE_RE.search(text))
+    return _qty_match_to_phase(WARMUP_QTY_BEFORE_RE.search(text)) or _qty_match_to_phase(
+        WARMUP_PHASE_RE.search(text)
+    )
 
 
 def _parse_cooldown_phase(text: str) -> PhaseEnd | None:
-    return _qty_match_to_phase(COOLDOWN_PHASE_RE.search(text))
+    return _qty_match_to_phase(COOLDOWN_QTY_BEFORE_RE.search(text)) or _qty_match_to_phase(
+        COOLDOWN_PHASE_RE.search(text)
+    )
 
 
-def _parse_recovery_phase(text: str) -> PhaseEnd | None:
-    return _qty_match_to_phase(RECOVERY_PHASE_RE.search(text))
+def _parse_inter_recovery(text: str) -> PhaseEnd | None:
+    return _qty_match_to_phase(INTER_RECOVERY_RE.search(text))
+
+
+def _parse_pre_repeat_rest(text: str) -> PhaseEnd | None:
+    return _qty_match_to_phase(PRE_REST_RE.search(text))
+
+
+def _parse_recovery_fallback(text: str) -> PhaseEnd | None:
+    return _qty_match_to_phase(RECOVERY_FALLBACK_RE.search(text))
+
+
+def _parse_slash_pace(text: str) -> tuple[str, str] | None:
+    """400> 1:28/32 → ('1:28', '1:32')."""
+    m = LAP_SLASH_PACE_RE.search(text)
+    if not m:
+        return None
+    a = m.group("a")
+    b_sec = m.group("b")
+    mins = a.split(":")[0]
+    return a, f"{mins}:{b_sec}"
 
 
 def _apply_phase_to_intent(intent: WorkoutIntent, text: str) -> WorkoutIntent:
-    """Sobrescreve warmup/cooldown/recovery a partir do texto (sempre)."""
-    wu = _parse_warmup_phase(text)
+    """Sobrescreve warmup/cooldown/recovery/pre-rest a partir do texto (sempre)."""
+    t = text.replace("\r", "\n")
+
+    wu = _parse_warmup_phase(t)
     if wu:
         intent.warmup = True
         intent.warmup_mode = wu.mode
         intent.warmup_seconds = wu.seconds
         intent.warmup_meters = wu.meters
-    elif _wants_warmup(text):
+    elif _wants_warmup(t):
         intent.warmup = True
 
-    cd = _parse_cooldown_phase(text)
+    cd = _parse_cooldown_phase(t)
     if cd:
         intent.cooldown = True
         intent.cooldown_mode = cd.mode
         intent.cooldown_seconds = cd.seconds
         intent.cooldown_meters = cd.meters
-    elif _wants_cooldown(text):
+    elif _wants_cooldown(t):
         intent.cooldown = True
 
-    rc = _parse_recovery_phase(text)
-    if rc:
-        intent.recovery_mode = rc.mode
-        intent.recovery_seconds = rc.seconds
-        intent.recovery_meters = rc.meters
+    # 1) recovery entre reps (intervalo parado…)
+    inter = _parse_inter_recovery(t)
+    # 2) descanso isolado (descanso parado…) — NÃO misturar com recovery
+    pre = _parse_pre_repeat_rest(t)
+
+    if inter:
+        intent.recovery_mode = inter.mode
+        intent.recovery_seconds = inter.seconds
+        intent.recovery_meters = inter.meters
+    elif pre is None:
+        # só usa fallback se não houver "descanso parado" competindo
+        fb = _parse_recovery_fallback(t)
+        if fb:
+            intent.recovery_mode = fb.mode
+            intent.recovery_seconds = fb.seconds
+            intent.recovery_meters = fb.meters
+
+    if pre:
+        # Se também existe inter-recovery, pre é descanso pós-aquecimento.
+        # Se NÃO existe inter e o único descanso era o pre, e recovery ainda lap:
+        # preferir pre como pre_repeat_rest e NÃO como recovery do repeat.
+        intent.pre_repeat_rest_mode = pre.mode
+        intent.pre_repeat_rest_seconds = pre.seconds
+        intent.pre_repeat_rest_meters = pre.meters
+        if not inter and intent.recovery_mode != "lap":
+            # recovery veio do mesmo "descanso"? limpa recovery do repeat
+            if (
+                intent.recovery_seconds == pre.seconds
+                and intent.recovery_meters == pre.meters
+            ):
+                intent.recovery_mode = "lap"
+                intent.recovery_seconds = None
+                intent.recovery_meters = None
+
+    slash = _parse_slash_pace(t)
+    if slash and intent.pace_mode == "none":
+        intent.pace_mode = "lap_time"
+        intent.pace_fast_clock, intent.pace_slow_clock = slash
+
     return intent
 
 
@@ -340,14 +447,26 @@ def _parse_intent_regex(text: str) -> WorkoutIntent | None:
     recovery_mode = "lap"
     recovery_seconds = None
     recovery_meters = None
-    rc = _parse_recovery_phase(t)
-    if rc:
-        recovery_mode = rc.mode
-        recovery_seconds = rc.seconds
-        recovery_meters = rc.meters
+    inter = _parse_inter_recovery(t)
+    pre = _parse_pre_repeat_rest(t)
+    if inter:
+        recovery_mode = inter.mode
+        recovery_seconds = inter.seconds
+        recovery_meters = inter.meters
+    elif not pre:
+        fb = _parse_recovery_fallback(t)
+        if fb:
+            recovery_mode = fb.mode
+            recovery_seconds = fb.seconds
+            recovery_meters = fb.meters
 
     wu = _parse_warmup_phase(t)
     cd = _parse_cooldown_phase(t)
+
+    slash = _parse_slash_pace(t)
+    if slash and pace_mode == "none":
+        pace_mode = "lap_time"
+        fast_c, slow_c = slash
 
     name = f"{reps}x{int(meters)}m"
     if fast_c and slow_c and fast_c != slow_c:
@@ -373,6 +492,9 @@ def _parse_intent_regex(text: str) -> WorkoutIntent | None:
         cooldown_mode=cd.mode if cd else "lap",
         cooldown_seconds=cd.seconds if cd else None,
         cooldown_meters=cd.meters if cd else None,
+        pre_repeat_rest_mode=pre.mode if pre else "none",
+        pre_repeat_rest_seconds=pre.seconds if pre else None,
+        pre_repeat_rest_meters=pre.meters if pre else None,
     )
 
 
@@ -523,6 +645,25 @@ def build_workout_from_intent(intent: WorkoutIntent) -> WorkoutBody:
         )
         order += 1
 
+    # Descanso parado entre aquecimento e o bloco de tiros
+    if intent.pre_repeat_rest_mode in {"time", "distance"}:
+        ek, eid, ev = _phase_end_from_intent(
+            intent.pre_repeat_rest_mode,
+            intent.pre_repeat_rest_seconds,
+            intent.pre_repeat_rest_meters,
+        )
+        steps.append(
+            _executable(
+                order=order,
+                step_key="rest",
+                step_id=5,
+                end_key=ek,
+                end_id=eid,
+                end_value=ev,
+            )
+        )
+        order += 1
+
     if intent.interval_meters:
         interval_step = _executable(
             order=order + 1,
@@ -633,7 +774,8 @@ def text_to_workout_body(text: str) -> WorkoutBody:
     intent = _apply_phase_to_intent(intent, text)
 
     logger.info(
-        "workout intent: reps=%s meters=%s pace=%s-%s recovery=%s/%s warmup=%s/%s cooldown=%s/%s",
+        "workout intent: reps=%s meters=%s pace=%s-%s recovery=%s/%s "
+        "warmup=%s/%s pre_rest=%s/%s cooldown=%s/%s",
         intent.reps,
         intent.interval_meters,
         intent.pace_fast_clock,
@@ -642,6 +784,8 @@ def text_to_workout_body(text: str) -> WorkoutBody:
         intent.recovery_seconds or intent.recovery_meters,
         intent.warmup_mode if intent.warmup else None,
         intent.warmup_seconds or intent.warmup_meters,
+        intent.pre_repeat_rest_mode,
+        intent.pre_repeat_rest_seconds or intent.pre_repeat_rest_meters,
         intent.cooldown_mode if intent.cooldown else None,
         intent.cooldown_seconds or intent.cooldown_meters,
     )
