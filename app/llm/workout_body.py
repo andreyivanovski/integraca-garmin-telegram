@@ -1,93 +1,144 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from openai import OpenAI
+from pydantic import BaseModel, field_validator
 
 from app.config import get_settings
 from app.garmin.workout_schema import WorkoutBody, normalize_workout_dict
 
-WARMUP_RE = re.compile(
-    r"(aquec\w*|warmup|warm[\s-]?up)",
-    re.IGNORECASE,
-)
+logger = logging.getLogger(__name__)
+
+WARMUP_RE = re.compile(r"(aquec\w*|warmup|warm[\s-]?up)", re.IGNORECASE)
 COOLDOWN_RE = re.compile(
     r"(desaquec\w*|cooldown|cool[\s-]?down|voltar?\s+a?\s*calma|volta\s+a\s+calma)",
     re.IGNORECASE,
 )
 
-SYSTEM_PROMPT = """Você converte descrições de treinos de corrida em JSON Garmin Connect.
+# 10x400 / 10 X 400 / 10 vezes de 400 m
+INTERVAL_RE = re.compile(
+    r"(?P<reps>\d+)\s*[x×]\s*(?P<dist>\d+(?:[.,]\d+)?)\s*(?P<unit>m|mt|metros|km)?",
+    re.IGNORECASE,
+)
+INTERVAL_RE_ALT = re.compile(
+    r"(?P<reps>\d+)\s*(?:vezes|reps?)\s*(?:de\s*)?(?P<dist>\d+(?:[.,]\d+)?)\s*(?P<unit>m|mt|metros|km)?",
+    re.IGNORECASE,
+)
 
-Responda APENAS JSON válido (sem markdown).
+# ritmo/pace 01:06 a 01:20 | 1:06-1:20 | 5:00/km | 5:00 a 5:30 /km
+PACE_RANGE_RE = re.compile(
+    r"(?:ritmo|pace|passo|em)?\s*"
+    r"(?P<a>\d{1,2}:\d{2})"
+    r"\s*(?:a|á|à|ate|até|-|–|—|ate|/)\s*"
+    r"(?P<b>\d{1,2}:\d{2})"
+    r"\s*(?P<perkm>/?\s*km|min/?km|por\s*km)?",
+    re.IGNORECASE,
+)
+PACE_SINGLE_RE = re.compile(
+    r"(?:ritmo|pace|passo)\s*(?:de\s*)?(?P<a>\d{1,2}:\d{2})"
+    r"\s*(?P<perkm>/?\s*km|min/?km|por\s*km)?",
+    re.IGNORECASE,
+)
 
-Campos OBRIGATÓRIOS em todo stepType: stepTypeId, stepTypeKey, displayOrder.
-Campos OBRIGATÓRIOS em todo endCondition: conditionTypeId, conditionTypeKey, displayOrder, displayable.
-Em RepeatGroupDTO: type="RepeatGroupDTO", numberOfIterations (int), workoutSteps (array), skipLastRestStep=true.
-Em ExecutableStepDTO: type="ExecutableStepDTO".
+# recovery 90s / pausa 1:30 / descanso 200m
+RECOVERY_TIME_RE = re.compile(
+    r"(?:recupera\w*|recovery|pausa|descans\w*|intervalo)\s*"
+    r"(?:de\s*)?(?P<val>\d+(?:[.,]\d+)?)\s*(?P<unit>s|seg|segs|segundos|min|mins|m|mt|metros)?",
+    re.IGNORECASE,
+)
 
-IDs:
-- stepType: warmup=1, cooldown=2, interval=3, recovery=4, repeat=6 (displayOrder=mesmo id)
-- endCondition: lap.button=1, time=2, distance=3, iterations=7
-- targetType padrão: {"workoutTargetTypeId":1,"workoutTargetTypeKey":"no.target","displayOrder":1}
+NORMALIZE_SYSTEM = """Você é um extrator. Converte texto de treino de corrida em JSON estrito.
 
-REGRA IMPORTANTE — aquecimento / desaquecimento:
-- NÃO inclua stepTypeKey "warmup" a menos que o usuário peça explicitamente (ex: aquecimento, warmup).
-- NÃO inclua stepTypeKey "cooldown" a menos que o usuário peça explicitamente (ex: desaquecimento, cooldown, volta à calma).
-- Se o usuário só pedir "10x300m", o workoutSteps deve ter APENAS o RepeatGroupDTO (intervalos + recovery), sem warmup e sem cooldown.
-
-Para "10x300m" / "10 vezes de 300 mt" (sem aquecimento/desaquecimento):
-- só RepeatGroupDTO numberOfIterations=10 com filhos:
-  - interval distance endConditionValue=300
-  - recovery lap.button endConditionValue=1000
-
-Exemplo (sem aquecimento/desaquecimento):
+Responda APENAS JSON (sem markdown) neste schema:
 {
-  "sportType": {"sportTypeId":1,"sportTypeKey":"running","displayOrder":1},
-  "workoutName": "10x300m",
-  "estimatedDistanceUnit": {"unitKey": null},
-  "workoutSegments": [{
-    "segmentOrder": 1,
-    "sportType": {"sportTypeId":1,"sportTypeKey":"running","displayOrder":1},
-    "workoutSteps": [
-      {
-        "type": "RepeatGroupDTO",
-        "stepOrder": 1,
-        "stepType": {"stepTypeId":6,"stepTypeKey":"repeat","displayOrder":6},
-        "numberOfIterations": 10,
-        "smartRepeat": false,
-        "childStepId": 1,
-        "skipLastRestStep": true,
-        "endCondition": {"conditionTypeId":7,"conditionTypeKey":"iterations","displayOrder":7,"displayable":false},
-        "workoutSteps": [
-          {
-            "type": "ExecutableStepDTO",
-            "stepOrder": 2,
-            "childStepId": 1,
-            "stepType": {"stepTypeId":3,"stepTypeKey":"interval","displayOrder":3},
-            "endCondition": {"conditionTypeId":3,"conditionTypeKey":"distance","displayOrder":3,"displayable":true},
-            "endConditionValue": 300,
-            "targetType": {"workoutTargetTypeId":1,"workoutTargetTypeKey":"no.target","displayOrder":1}
-          },
-          {
-            "type": "ExecutableStepDTO",
-            "stepOrder": 3,
-            "childStepId": 1,
-            "stepType": {"stepTypeId":4,"stepTypeKey":"recovery","displayOrder":4},
-            "endCondition": {"conditionTypeId":1,"conditionTypeKey":"lap.button","displayOrder":1,"displayable":true},
-            "endConditionValue": 1000,
-            "targetType": {"workoutTargetTypeId":1,"workoutTargetTypeKey":"no.target","displayOrder":1}
-          }
-        ]
-      }
-    ]
-  }],
-  "estimatedDurationInSecs": 0,
-  "estimatedDistanceInMeters": 0,
-  "isWheelchair": false
+  "workout_name": string,
+  "reps": int|null,
+  "interval_meters": number|null,
+  "interval_seconds": number|null,
+  "pace_mode": "none"|"lap_time"|"per_km",
+  "pace_fast_clock": "M:SS"|null,
+  "pace_slow_clock": "M:SS"|null,
+  "recovery_mode": "lap"|"time"|"distance",
+  "recovery_seconds": number|null,
+  "recovery_meters": number|null,
+  "warmup": bool,
+  "cooldown": bool
 }
+
+REGRAS (obrigatórias):
+1) "10x400" / "10 X 400" → reps=10, interval_meters=400
+2) Distância do intervalo em METROS (km → *1000). Tempo do intervalo em SEGUNDOS.
+3) Ritmo "01:06 a 01:20" junto de um intervalo em metros (ex 400) → pace_mode="lap_time"
+   (tempo para percorrer ESSA distância). NÃO trate como min/km.
+4) Ritmo "5:00/km" ou "5:00 a 5:30 por km" → pace_mode="per_km"
+5) Se só um relógio (ex ritmo 5:00/km) → pace_fast_clock=pace_slow_clock
+6) Recovery padrão = lap (botão), salvo se pedir segundos/metros de pausa
+7) warmup/cooldown = true SÓ se o texto pedir
+8) sport sempre corrida — não invente outros esportes
+9) Nunca truncar nomes; clocks sempre "M:SS" ou "MM:SS"
 """
+
+
+class WorkoutIntent(BaseModel):
+    workout_name: str = "Treino"
+    reps: int | None = None
+    interval_meters: float | None = None
+    interval_seconds: float | None = None
+    pace_mode: str = "none"  # none | lap_time | per_km
+    pace_fast_clock: str | None = None
+    pace_slow_clock: str | None = None
+    recovery_mode: str = "lap"  # lap | time | distance
+    recovery_seconds: float | None = None
+    recovery_meters: float | None = None
+    warmup: bool = False
+    cooldown: bool = False
+
+    @field_validator("pace_mode", mode="before")
+    @classmethod
+    def _pace_mode(cls, v: Any) -> str:
+        v = (str(v) if v is not None else "none").lower().strip()
+        if v in {"lap", "lap_time", "lap-time", "tempo_volta"}:
+            return "lap_time"
+        if v in {"km", "per_km", "per-km", "min_km", "pace_km"}:
+            return "per_km"
+        if v in {"none", "", "null", "no"}:
+            return "none"
+        return v if v in {"none", "lap_time", "per_km"} else "none"
+
+    @field_validator("recovery_mode", mode="before")
+    @classmethod
+    def _rec_mode(cls, v: Any) -> str:
+        v = (str(v) if v is not None else "lap").lower().strip()
+        if v in {"time", "tempo", "seconds", "segundos"}:
+            return "time"
+        if v in {"distance", "distancia", "metros", "m"}:
+            return "distance"
+        return "lap"
+
+
+@dataclass
+class PaceTarget:
+    """Velocidades em m/s (Garmin pace.zone: One=mais rápido, Two=mais lento)."""
+
+    fast_mps: float
+    slow_mps: float
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "targetType": {
+                "workoutTargetTypeId": 6,
+                "workoutTargetTypeKey": "pace.zone",
+                "displayOrder": 6,
+            },
+            "targetValueOne": self.fast_mps,
+            "targetValueTwo": self.slow_mps,
+            "targetValueUnit": None,
+        }
 
 
 def _wants_warmup(text: str) -> bool:
@@ -98,52 +149,121 @@ def _wants_cooldown(text: str) -> bool:
     return bool(COOLDOWN_RE.search(text))
 
 
-def _lap_step(order: int, step_key: str, step_id: int) -> dict[str, Any]:
+def _clock_to_seconds(clock: str) -> float:
+    clock = clock.strip()
+    parts = clock.split(":")
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    raise ValueError(f"Relógio inválido: {clock}")
+
+
+def _seconds_to_mps_for_distance(seconds: float, meters: float) -> float:
+    if seconds <= 0 or meters <= 0:
+        raise ValueError("tempo/distância inválidos para pace")
+    return meters / seconds
+
+
+def _per_km_clock_to_mps(clock: str) -> float:
+    secs = _clock_to_seconds(clock)
+    if secs <= 0:
+        raise ValueError("pace/km inválido")
+    return 1000.0 / secs
+
+
+def _no_target() -> dict[str, Any]:
     return {
-        "type": "ExecutableStepDTO",
-        "stepOrder": order,
-        "stepType": {
-            "stepTypeId": step_id,
-            "stepTypeKey": step_key,
-            "displayOrder": step_id,
-        },
-        "endCondition": {
-            "conditionTypeId": 1,
-            "conditionTypeKey": "lap.button",
-            "displayOrder": 1,
-            "displayable": True,
-        },
-        "endConditionValue": 1000,
         "targetType": {
             "workoutTargetTypeId": 1,
             "workoutTargetTypeKey": "no.target",
             "displayOrder": 1,
-        },
+        }
     }
 
 
-def _strip_unrequested_warm_cool(raw: dict[str, Any], text: str) -> dict[str, Any]:
-    """Remove warmup/cooldown gerados pela LLM se o usuário não pediu."""
-    want_w = _wants_warmup(text)
-    want_c = _wants_cooldown(text)
-    if want_w and want_c:
-        return raw
+def _resolve_pace(intent: WorkoutIntent) -> PaceTarget | None:
+    if intent.pace_mode == "none" or not intent.pace_fast_clock:
+        return None
+    fast_c = intent.pace_fast_clock
+    slow_c = intent.pace_slow_clock or intent.pace_fast_clock
+    try:
+        if intent.pace_mode == "lap_time":
+            meters = float(intent.interval_meters or 0)
+            if meters <= 0:
+                return None
+            a = _seconds_to_mps_for_distance(_clock_to_seconds(fast_c), meters)
+            b = _seconds_to_mps_for_distance(_clock_to_seconds(slow_c), meters)
+        else:  # per_km
+            a = _per_km_clock_to_mps(fast_c)
+            b = _per_km_clock_to_mps(slow_c)
+    except ValueError:
+        return None
+    # One = mais rápido (maior m/s), Two = mais lento
+    return PaceTarget(fast_mps=max(a, b), slow_mps=min(a, b))
 
-    for seg in raw.get("workoutSegments") or []:
-        steps = seg.get("workoutSteps") or []
-        kept = []
-        for step in steps:
-            key = (step.get("stepType") or {}).get("stepTypeKey")
-            if key == "warmup" and not want_w:
-                continue
-            if key == "cooldown" and not want_c:
-                continue
-            kept.append(step)
-        # renumerar stepOrder
-        for i, step in enumerate(kept, start=1):
-            step["stepOrder"] = i
-        seg["workoutSteps"] = kept
-    return raw
+
+def _parse_intent_regex(text: str) -> WorkoutIntent | None:
+    t = text.strip()
+    m = INTERVAL_RE.search(t) or INTERVAL_RE_ALT.search(t)
+    if not m:
+        return None
+
+    reps = int(m.group("reps"))
+    dist = float(m.group("dist").replace(",", "."))
+    unit = (m.group("unit") or "m").lower()
+    meters = dist * 1000 if unit.startswith("km") else dist
+
+    pace_mode = "none"
+    fast_c = slow_c = None
+    pr = PACE_RANGE_RE.search(t)
+    ps = None if pr else PACE_SINGLE_RE.search(t)
+    if pr:
+        fast_c, slow_c = pr.group("a"), pr.group("b")
+        perkm = bool(pr.group("perkm"))
+        # Com distância de intervalo e clocks ~1–3 min → tempo de volta
+        pace_mode = "per_km" if perkm else "lap_time"
+    elif ps:
+        fast_c = slow_c = ps.group("a")
+        perkm = bool(ps.group("perkm"))
+        pace_mode = "per_km" if perkm else "lap_time"
+
+    recovery_mode = "lap"
+    recovery_seconds = None
+    recovery_meters = None
+    rr = RECOVERY_TIME_RE.search(t)
+    if rr:
+        val = float(rr.group("val").replace(",", "."))
+        u = (rr.group("unit") or "s").lower()
+        if u.startswith("min"):
+            recovery_mode = "time"
+            recovery_seconds = val * 60
+        elif u in {"m", "mt", "metros"}:
+            recovery_mode = "distance"
+            recovery_meters = val
+        else:
+            recovery_mode = "time"
+            recovery_seconds = val
+
+    name = f"{reps}x{int(meters)}m"
+    if fast_c and slow_c and fast_c != slow_c:
+        name += f" @{fast_c}-{slow_c}"
+    elif fast_c:
+        name += f" @{fast_c}"
+
+    return WorkoutIntent(
+        workout_name=name,
+        reps=reps,
+        interval_meters=meters,
+        pace_mode=pace_mode,
+        pace_fast_clock=fast_c,
+        pace_slow_clock=slow_c,
+        recovery_mode=recovery_mode,
+        recovery_seconds=recovery_seconds,
+        recovery_meters=recovery_meters,
+        warmup=_wants_warmup(t),
+        cooldown=_wants_cooldown(t),
+    )
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -152,46 +272,191 @@ def _extract_json(text: str) -> dict[str, Any]:
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
     if not text.startswith("{"):
-        m = re.search(r"\{[\s\S]*\}", text)
-        if m:
-            text = m.group(0)
+        found = re.search(r"\{[\s\S]*\}", text)
+        if found:
+            text = found.group(0)
     return json.loads(text)
 
 
-def _fallback_interval_workout(text: str) -> WorkoutBody | None:
-    """Heurística para padrões tipo 10x300m / 10 vezes de 300 mt."""
-    t = text.lower().replace(",", ".")
-    m = re.search(
-        r"(\d+)\s*[x×]\s*(\d+(?:\.\d+)?)\s*(m|mt|metros|km)?",
-        t,
-    )
-    if not m:
-        m = re.search(
-            r"(\d+)\s*(?:vezes|reps?)\s*(?:de\s*)?(\d+(?:\.\d+)?)\s*(m|mt|metros|km)?",
-            t,
-        )
-    if not m:
+def _parse_intent_llm(text: str) -> WorkoutIntent | None:
+    settings = get_settings()
+    if not settings.groq_api_key:
         return None
+    client = OpenAI(api_key=settings.groq_api_key, base_url=settings.groq_base_url)
+    resp = client.chat.completions.create(
+        model=settings.groq_model,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": NORMALIZE_SYSTEM},
+            {
+                "role": "user",
+                "content": (
+                    "Normalize este treino. "
+                    "Se houver metros no intervalo e ritmo tipo 01:06–01:20, use pace_mode=lap_time.\n\n"
+                    f"{text.strip()}"
+                ),
+            },
+        ],
+    )
+    content = resp.choices[0].message.content or ""
+    raw = _extract_json(content)
+    # reforça warmup/cooldown pelo texto
+    raw["warmup"] = bool(raw.get("warmup")) or _wants_warmup(text)
+    raw["cooldown"] = bool(raw.get("cooldown")) or _wants_cooldown(text)
+    return WorkoutIntent.model_validate(raw)
 
-    reps = int(m.group(1))
-    dist = float(m.group(2))
-    unit = (m.group(3) or "m").lower()
-    meters = dist * 1000 if unit.startswith("km") else dist
-    name = f"{reps}x{int(meters)}m"
 
+def normalize_intent(text: str) -> WorkoutIntent:
+    """Agente 1: texto → intent estruturado (regex primeiro, LLM se precisar)."""
+    intent = _parse_intent_regex(text)
+    if intent and intent.reps and (intent.interval_meters or intent.interval_seconds):
+        # Se regex achou intervalo mas sem pace e o texto tem ritmo, tenta LLM só pro pace
+        if intent.pace_mode == "none" and re.search(r"\d{1,2}:\d{2}", text):
+            llm = _parse_intent_llm(text)
+            if llm and llm.pace_mode != "none":
+                intent.pace_mode = llm.pace_mode
+                intent.pace_fast_clock = llm.pace_fast_clock
+                intent.pace_slow_clock = llm.pace_slow_clock or llm.pace_fast_clock
+                if llm.workout_name and llm.workout_name != "Treino":
+                    intent.workout_name = llm.workout_name
+        return intent
+
+    llm = _parse_intent_llm(text)
+    if llm:
+        return llm
+    if intent:
+        return intent
+    raise ValueError(
+        "Não entendi o treino. Ex.: 10x400 ritmo 01:06 a 01:20"
+    )
+
+
+def _target_dict(pace: PaceTarget | None) -> dict[str, Any]:
+    return pace.as_dict() if pace else _no_target()
+
+
+def _executable(
+    *,
+    order: int,
+    step_key: str,
+    step_id: int,
+    end_key: str,
+    end_id: int,
+    end_value: float,
+    displayable: bool = True,
+    child_step_id: int | None = None,
+    pace: PaceTarget | None = None,
+) -> dict[str, Any]:
+    step: dict[str, Any] = {
+        "type": "ExecutableStepDTO",
+        "stepOrder": order,
+        "stepType": {
+            "stepTypeId": step_id,
+            "stepTypeKey": step_key,
+            "displayOrder": step_id,
+        },
+        "endCondition": {
+            "conditionTypeId": end_id,
+            "conditionTypeKey": end_key,
+            "displayOrder": end_id,
+            "displayable": displayable,
+        },
+        "endConditionValue": end_value,
+        **_target_dict(pace),
+        "preferredEndConditionUnit": None,
+        "stepAudioNote": None,
+        "category": None,
+        "exerciseName": None,
+    }
+    if child_step_id is not None:
+        step["childStepId"] = child_step_id
+    return step
+
+
+def build_workout_from_intent(intent: WorkoutIntent) -> WorkoutBody:
+    """Agente 2: intent → JSON Garmin determinístico (sem LLM)."""
+    if not intent.reps:
+        raise ValueError("Treino precisa de repetições (ex: 10x400)")
+    if not intent.interval_meters and not intent.interval_seconds:
+        raise ValueError("Treino precisa de distância ou tempo no intervalo")
+
+    pace = _resolve_pace(intent)
     steps: list[dict[str, Any]] = []
     order = 1
 
-    if _wants_warmup(text):
-        steps.append(_lap_step(order, "warmup", 1))
+    if intent.warmup:
+        steps.append(
+            _executable(
+                order=order,
+                step_key="warmup",
+                step_id=1,
+                end_key="lap.button",
+                end_id=1,
+                end_value=1000,
+            )
+        )
         order += 1
+
+    if intent.interval_meters:
+        interval_step = _executable(
+            order=order + 1,
+            step_key="interval",
+            step_id=3,
+            end_key="distance",
+            end_id=3,
+            end_value=float(intent.interval_meters),
+            child_step_id=1,
+            pace=pace,
+        )
+    else:
+        interval_step = _executable(
+            order=order + 1,
+            step_key="interval",
+            step_id=3,
+            end_key="time",
+            end_id=2,
+            end_value=float(intent.interval_seconds or 0),
+            child_step_id=1,
+            pace=pace,
+        )
+
+    if intent.recovery_mode == "time" and intent.recovery_seconds:
+        recovery_step = _executable(
+            order=order + 2,
+            step_key="recovery",
+            step_id=4,
+            end_key="time",
+            end_id=2,
+            end_value=float(intent.recovery_seconds),
+            child_step_id=1,
+        )
+    elif intent.recovery_mode == "distance" and intent.recovery_meters:
+        recovery_step = _executable(
+            order=order + 2,
+            step_key="recovery",
+            step_id=4,
+            end_key="distance",
+            end_id=3,
+            end_value=float(intent.recovery_meters),
+            child_step_id=1,
+        )
+    else:
+        recovery_step = _executable(
+            order=order + 2,
+            step_key="recovery",
+            step_id=4,
+            end_key="lap.button",
+            end_id=1,
+            end_value=1000,
+            child_step_id=1,
+        )
 
     steps.append(
         {
             "type": "RepeatGroupDTO",
             "stepOrder": order,
             "stepType": {"stepTypeId": 6, "stepTypeKey": "repeat", "displayOrder": 6},
-            "numberOfIterations": reps,
+            "numberOfIterations": int(intent.reps),
             "smartRepeat": False,
             "childStepId": 1,
             "skipLastRestStep": True,
@@ -201,106 +466,69 @@ def _fallback_interval_workout(text: str) -> WorkoutBody | None:
                 "displayOrder": 7,
                 "displayable": False,
             },
-            "workoutSteps": [
-                {
-                    "type": "ExecutableStepDTO",
-                    "stepOrder": order + 1,
-                    "childStepId": 1,
-                    "stepType": {
-                        "stepTypeId": 3,
-                        "stepTypeKey": "interval",
-                        "displayOrder": 3,
-                    },
-                    "endCondition": {
-                        "conditionTypeId": 3,
-                        "conditionTypeKey": "distance",
-                        "displayOrder": 3,
-                        "displayable": True,
-                    },
-                    "endConditionValue": meters,
-                    "targetType": {
-                        "workoutTargetTypeId": 1,
-                        "workoutTargetTypeKey": "no.target",
-                        "displayOrder": 1,
-                    },
-                },
-                {
-                    "type": "ExecutableStepDTO",
-                    "stepOrder": order + 2,
-                    "childStepId": 1,
-                    "stepType": {
-                        "stepTypeId": 4,
-                        "stepTypeKey": "recovery",
-                        "displayOrder": 4,
-                    },
-                    "endCondition": {
-                        "conditionTypeId": 1,
-                        "conditionTypeKey": "lap.button",
-                        "displayOrder": 1,
-                        "displayable": True,
-                    },
-                    "endConditionValue": 1000,
-                    "targetType": {
-                        "workoutTargetTypeId": 1,
-                        "workoutTargetTypeKey": "no.target",
-                        "displayOrder": 1,
-                    },
-                },
-            ],
+            "workoutSteps": [interval_step, recovery_step],
         }
     )
     order += 1
 
-    if _wants_cooldown(text):
-        steps.append(_lap_step(order, "cooldown", 2))
+    if intent.cooldown:
+        steps.append(
+            _executable(
+                order=order,
+                step_key="cooldown",
+                step_id=2,
+                end_key="lap.button",
+                end_id=1,
+                end_value=1000,
+            )
+        )
 
+    sport = {"sportTypeId": 1, "sportTypeKey": "running", "displayOrder": 1}
     raw = {
-        "sportType": {"sportTypeId": 1, "sportTypeKey": "running", "displayOrder": 1},
-        "workoutName": name,
+        "sportType": sport,
+        "subSportType": None,
+        "workoutName": (intent.workout_name or "Treino")[:100],
         "estimatedDistanceUnit": {"unitKey": None},
         "workoutSegments": [
             {
                 "segmentOrder": 1,
-                "sportType": {"sportTypeId": 1, "sportTypeKey": "running", "displayOrder": 1},
+                "sportType": sport,
                 "workoutSteps": steps,
             }
         ],
         "estimatedDurationInSecs": 0,
         "estimatedDistanceInMeters": 0,
+        "estimateType": None,
         "isWheelchair": False,
     }
+    if pace:
+        raw["avgTrainingSpeed"] = (pace.fast_mps + pace.slow_mps) / 2
+
     return WorkoutBody.model_validate(normalize_workout_dict(raw))
 
 
 def text_to_workout_body(text: str) -> WorkoutBody:
-    settings = get_settings()
-    if not settings.groq_api_key:
-        fb = _fallback_interval_workout(text)
-        if fb:
-            return fb
-        raise RuntimeError("GROQ_API_KEY não configurada.")
+    """
+    Pipeline:
+      1) normalizar intent (regex → LLM)
+      2) montar JSON Garmin determinístico
+    """
+    text = text.strip()
+    if not text:
+        raise ValueError("Texto de treino vazio")
 
-    client = OpenAI(api_key=settings.groq_api_key, base_url=settings.groq_base_url)
-    resp = client.chat.completions.create(
-        model=settings.groq_model,
-        temperature=0.1,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": text.strip()},
-        ],
+    intent = normalize_intent(text)
+    # reforço final warmup/cooldown pelo texto do usuário
+    intent.warmup = intent.warmup or _wants_warmup(text)
+    intent.cooldown = intent.cooldown or _wants_cooldown(text)
+
+    logger.info(
+        "workout intent: reps=%s meters=%s pace_mode=%s %s-%s recovery=%s",
+        intent.reps,
+        intent.interval_meters,
+        intent.pace_mode,
+        intent.pace_fast_clock,
+        intent.pace_slow_clock,
+        intent.recovery_mode,
     )
-    content = resp.choices[0].message.content or ""
-    try:
-        raw = _strip_unrequested_warm_cool(_extract_json(content), text)
-        raw = normalize_workout_dict(raw)
-        body = WorkoutBody.model_validate(raw)
-        for seg in body.workoutSegments:
-            for step in seg.workoutSteps:
-                if getattr(step, "type", None) == "RepeatGroupDTO" and not step.workoutSteps:
-                    raise ValueError("RepeatGroup sem filhos")
-        return body
-    except Exception:
-        fb = _fallback_interval_workout(text)
-        if fb:
-            return fb
-        raise
+    return build_workout_from_intent(intent)

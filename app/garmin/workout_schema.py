@@ -205,12 +205,22 @@ class WorkoutBody(BaseModel):
         for seg in self.workoutSegments:
             for step in seg.workoutSteps:
                 if getattr(step, "type", None) == "RepeatGroupDTO" or isinstance(step, RepeatGroup):
-                    child = ", ".join(
-                        f"{c.stepType.stepTypeKey}/{c.endCondition.conditionTypeKey}"
-                        f"={c.endConditionValue}"
-                        for c in step.workoutSteps
-                    )
-                    lines.append(f"- Repeat x{step.numberOfIterations}: {child}")
+                    child_bits = []
+                    for c in step.workoutSteps:
+                        bit = (
+                            f"{c.stepType.stepTypeKey}/"
+                            f"{c.endCondition.conditionTypeKey}={c.endConditionValue}"
+                        )
+                        tt = getattr(c.targetType, "workoutTargetTypeKey", None) or "no.target"
+                        if tt == "pace.zone" and c.targetValueOne and c.targetValueTwo:
+                            # m/s → s/km aproximado para leitura
+                            def _fmt(mps: float) -> str:
+                                spk = 1000.0 / mps
+                                return f"{int(spk // 60)}:{int(spk % 60):02d}/km"
+
+                            bit += f" pace {_fmt(c.targetValueOne)}-{_fmt(c.targetValueTwo)}"
+                        child_bits.append(bit)
+                    lines.append(f"- Repeat x{step.numberOfIterations}: {', '.join(child_bits)}")
                 else:
                     lines.append(
                         f"- {step.stepType.stepTypeKey}: "
@@ -219,13 +229,28 @@ class WorkoutBody(BaseModel):
         return "\n".join(lines)
 
 
+def _fix_sport(st: Any) -> dict[str, Any]:
+    if not isinstance(st, dict):
+        return {"sportTypeId": 1, "sportTypeKey": "running", "displayOrder": 1}
+    out = dict(st)
+    key = str(out.get("sportTypeKey") or "running").lower().strip()
+    # LLM às vezes trunca: runnin, runni, run
+    if key.startswith("run"):
+        key = "running"
+        out["sportTypeId"] = 1
+    out["sportTypeKey"] = key
+    out.setdefault("sportTypeId", 1 if key == "running" else out.get("sportTypeId") or 1)
+    out.setdefault("displayOrder", out.get("sportTypeId") or 1)
+    # chave incompleta / inválida → força running (uso atual do bot)
+    if key not in {"running", "cycling", "swimming", "strength_training", "cardio", "yoga"}:
+        out = {"sportTypeId": 1, "sportTypeKey": "running", "displayOrder": 1}
+    return out
+
+
 def normalize_workout_dict(raw: dict[str, Any]) -> dict[str, Any]:
     """Preenche campos que a LLM costuma omitir e corrige aliases."""
     data = dict(raw)
-    data.setdefault(
-        "sportType",
-        {"sportTypeId": 1, "sportTypeKey": "running", "displayOrder": 1},
-    )
+    data["sportType"] = _fix_sport(data.get("sportType"))
     data.setdefault("estimatedDistanceUnit", {"unitKey": None})
     data.setdefault("estimatedDurationInSecs", 0)
     data.setdefault("estimatedDistanceInMeters", 0)
@@ -239,19 +264,24 @@ def normalize_workout_dict(raw: dict[str, Any]) -> dict[str, Any]:
 
     fixed_segments = []
     for i, seg in enumerate(segments):
+        if seg is None:
+            continue
         s = dict(seg)
-        s.setdefault("segmentOrder", i + 1)
-        s.setdefault(
-            "sportType",
-            data.get("sportType")
-            or {"sportTypeId": 1, "sportTypeKey": "running", "displayOrder": 1},
-        )
+        s["segmentOrder"] = int(s.get("segmentOrder") or (i + 1))
+        s["sportType"] = _fix_sport(s.get("sportType") or data.get("sportType"))
         steps = []
         for j, step in enumerate(s.get("workoutSteps") or []):
+            if step is None:
+                continue
             st = dict(step)
             st.setdefault("stepOrder", j + 1)
             step_type = st.get("type") or st.get("stepType", {}).get("stepTypeKey")
-            if step_type == "repeat" or st.get("type") == "RepeatGroupDTO" or "numberOfIterations" in st or "iterations" in st:
+            if (
+                step_type == "repeat"
+                or st.get("type") == "RepeatGroupDTO"
+                or "numberOfIterations" in st
+                or "iterations" in st
+            ):
                 st["type"] = "RepeatGroupDTO"
                 if "workoutSteps" not in st:
                     for alt in ("steps", "childSteps", "children"):
@@ -260,16 +290,29 @@ def normalize_workout_dict(raw: dict[str, Any]) -> dict[str, Any]:
                             break
                 children = []
                 for k, ch in enumerate(st.get("workoutSteps") or []):
+                    if ch is None:
+                        continue
                     child = dict(ch)
                     child.setdefault("type", "ExecutableStepDTO")
                     child.setdefault("stepOrder", k + 1)
                     child.setdefault("childStepId", 1)
                     children.append(child)
                 st["workoutSteps"] = children
+                if not children:
+                    continue  # repeat vazio → descarta (evita 400)
             else:
                 st.setdefault("type", "ExecutableStepDTO")
             steps.append(st)
+        if not steps:
+            continue  # segmento sem steps → 400 da Garmin
         s["workoutSteps"] = steps
         fixed_segments.append(s)
+
+    if not fixed_segments:
+        raise ValueError("Workout sem segmentos/steps válidos")
+
+    # Garante segmentOrder único e sequencial
+    for i, s in enumerate(fixed_segments):
+        s["segmentOrder"] = i + 1
     data["workoutSegments"] = fixed_segments
     return data
