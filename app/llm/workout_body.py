@@ -14,9 +14,9 @@ from app.garmin.workout_schema import WorkoutBody, normalize_workout_dict
 
 logger = logging.getLogger(__name__)
 
-WARMUP_RE = re.compile(r"(aquec\w*|warmup|warm[\s-]?up)", re.IGNORECASE)
+WARMUP_RE = re.compile(r"(?:(?<!des)aquec\w*|warmup|warm[\s-]?up)", re.IGNORECASE)
 COOLDOWN_RE = re.compile(
-    r"(desaquec\w*|cooldown|cool[\s-]?down|voltar?\s+a?\s*calma|volta\s+a\s+calma)",
+    r"(?:desaquec\w*|cooldown|cool[\s-]?down|voltar?\s+a?\s*calma|volta\s+a\s+calma)",
     re.IGNORECASE,
 )
 
@@ -45,10 +45,28 @@ PACE_SINGLE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# recovery 90s / pausa 1:30 / descanso 200m
-RECOVERY_TIME_RE = re.compile(
-    r"(?:recupera\w*|recovery|pausa|descans\w*|intervalo)\s*"
-    r"(?:de\s*)?(?P<val>\d+(?:[.,]\d+)?)\s*(?P<unit>s|seg|segs|segundos|min|mins|m|mt|metros)?",
+# aquecimento|desaquecimento|recuperação + tempo/distância/relógio
+# Exemplos: "aquecimento 10 min", "desaquec 1km", "pausa 90s", "recuperação 01:30", "recovery 200m"
+_PHASE_QTY = (
+    r"(?:de\s*|com\s*|em\s*|por\s*)?"
+    r"(?:"
+    r"(?P<clock>\d{1,2}:\d{2})"
+    r"|"
+    r"(?P<val>\d+(?:[.,]\d+)?)\s*"
+    r"(?P<unit>s|seg|segs|segundos|min|mins|minuto\w*|h|hora\w*|m|mt|metros|km)?"
+    r")"
+)
+
+WARMUP_PHASE_RE = re.compile(
+    rf"(?:(?<!des)aquec\w*|warmup|warm[\s-]?up)\s*{_PHASE_QTY}",
+    re.IGNORECASE,
+)
+COOLDOWN_PHASE_RE = re.compile(
+    rf"(?:desaquec\w*|cooldown|cool[\s-]?down|volta(?:r)?\s+a\s*calma)\s*{_PHASE_QTY}",
+    re.IGNORECASE,
+)
+RECOVERY_PHASE_RE = re.compile(
+    rf"(?:recupera(?:ção|cao|\w*)|recovery|pausa|descans\w*|repouso|entre\s+(?:elas|eles|tiros|séries|series))\s*{_PHASE_QTY}",
     re.IGNORECASE,
 )
 
@@ -67,7 +85,13 @@ Responda APENAS JSON (sem markdown) neste schema:
   "recovery_seconds": number|null,
   "recovery_meters": number|null,
   "warmup": bool,
-  "cooldown": bool
+  "warmup_mode": "lap"|"time"|"distance",
+  "warmup_seconds": number|null,
+  "warmup_meters": number|null,
+  "cooldown": bool,
+  "cooldown_mode": "lap"|"time"|"distance",
+  "cooldown_seconds": number|null,
+  "cooldown_meters": number|null
 }
 
 REGRAS (obrigatórias):
@@ -77,8 +101,11 @@ REGRAS (obrigatórias):
    (tempo para percorrer ESSA distância). NÃO trate como min/km.
 4) Ritmo "5:00/km" ou "5:00 a 5:30 por km" → pace_mode="per_km"
 5) Se só um relógio (ex ritmo 5:00/km) → pace_fast_clock=pace_slow_clock
-6) Recovery padrão = lap (botão), salvo se pedir segundos/metros de pausa
-7) warmup/cooldown = true SÓ se o texto pedir
+6) Recovery / aquecimento / desaquecimento:
+   - Se pedir tempo (90s, 2 min, 01:30) → mode="time" e seconds
+   - Se pedir distância (200m, 1km) → mode="distance" e meters
+   - Só use mode="lap" (botão) se NÃO houver tempo nem distância
+7) warmup/cooldown = true SÓ se o texto pedir; preencha warmup_*/cooldown_* quando houver quantidade
 8) sport sempre corrida — não invente outros esportes
 9) Nunca truncar nomes; clocks sempre "M:SS" ou "MM:SS"
 """
@@ -96,7 +123,13 @@ class WorkoutIntent(BaseModel):
     recovery_seconds: float | None = None
     recovery_meters: float | None = None
     warmup: bool = False
+    warmup_mode: str = "lap"
+    warmup_seconds: float | None = None
+    warmup_meters: float | None = None
     cooldown: bool = False
+    cooldown_mode: str = "lap"
+    cooldown_seconds: float | None = None
+    cooldown_meters: float | None = None
 
     @field_validator("pace_mode", mode="before")
     @classmethod
@@ -110,15 +143,22 @@ class WorkoutIntent(BaseModel):
             return "none"
         return v if v in {"none", "lap_time", "per_km"} else "none"
 
-    @field_validator("recovery_mode", mode="before")
+    @field_validator("recovery_mode", "warmup_mode", "cooldown_mode", mode="before")
     @classmethod
-    def _rec_mode(cls, v: Any) -> str:
+    def _end_mode(cls, v: Any) -> str:
         v = (str(v) if v is not None else "lap").lower().strip()
         if v in {"time", "tempo", "seconds", "segundos"}:
             return "time"
         if v in {"distance", "distancia", "metros", "m"}:
             return "distance"
         return "lap"
+
+
+@dataclass
+class PhaseEnd:
+    mode: str = "lap"  # lap | time | distance
+    seconds: float | None = None
+    meters: float | None = None
 
 
 @dataclass
@@ -147,6 +187,75 @@ def _wants_warmup(text: str) -> bool:
 
 def _wants_cooldown(text: str) -> bool:
     return bool(COOLDOWN_RE.search(text))
+
+
+def _qty_match_to_phase(m: re.Match[str] | None) -> PhaseEnd | None:
+    if not m:
+        return None
+    clock = m.groupdict().get("clock")
+    if clock:
+        try:
+            return PhaseEnd(mode="time", seconds=_clock_to_seconds(clock))
+        except ValueError:
+            return None
+    raw_val = m.groupdict().get("val")
+    if raw_val is None:
+        return None
+    val = float(str(raw_val).replace(",", "."))
+    unit = (m.groupdict().get("unit") or "").lower().strip()
+    if unit.startswith("min") or unit.startswith("hora") or unit == "h":
+        mult = 3600 if unit.startswith("hora") or unit == "h" else 60
+        return PhaseEnd(mode="time", seconds=val * mult)
+    if unit.startswith("km"):
+        return PhaseEnd(mode="distance", meters=val * 1000)
+    if unit in {"m", "mt", "metros"}:
+        return PhaseEnd(mode="distance", meters=val)
+    if unit.startswith("s") or unit.startswith("seg") or unit == "":
+        # sem unidade: se valor grande (>=100) assume metros; senão segundos
+        if not unit and val >= 100:
+            return PhaseEnd(mode="distance", meters=val)
+        return PhaseEnd(mode="time", seconds=val)
+    return PhaseEnd(mode="time", seconds=val)
+
+
+def _parse_warmup_phase(text: str) -> PhaseEnd | None:
+    return _qty_match_to_phase(WARMUP_PHASE_RE.search(text))
+
+
+def _parse_cooldown_phase(text: str) -> PhaseEnd | None:
+    return _qty_match_to_phase(COOLDOWN_PHASE_RE.search(text))
+
+
+def _parse_recovery_phase(text: str) -> PhaseEnd | None:
+    return _qty_match_to_phase(RECOVERY_PHASE_RE.search(text))
+
+
+def _apply_phase_to_intent(intent: WorkoutIntent, text: str) -> WorkoutIntent:
+    """Sobrescreve warmup/cooldown/recovery a partir do texto (sempre)."""
+    wu = _parse_warmup_phase(text)
+    if wu:
+        intent.warmup = True
+        intent.warmup_mode = wu.mode
+        intent.warmup_seconds = wu.seconds
+        intent.warmup_meters = wu.meters
+    elif _wants_warmup(text):
+        intent.warmup = True
+
+    cd = _parse_cooldown_phase(text)
+    if cd:
+        intent.cooldown = True
+        intent.cooldown_mode = cd.mode
+        intent.cooldown_seconds = cd.seconds
+        intent.cooldown_meters = cd.meters
+    elif _wants_cooldown(text):
+        intent.cooldown = True
+
+    rc = _parse_recovery_phase(text)
+    if rc:
+        intent.recovery_mode = rc.mode
+        intent.recovery_seconds = rc.seconds
+        intent.recovery_meters = rc.meters
+    return intent
 
 
 def _clock_to_seconds(clock: str) -> float:
@@ -231,19 +340,14 @@ def _parse_intent_regex(text: str) -> WorkoutIntent | None:
     recovery_mode = "lap"
     recovery_seconds = None
     recovery_meters = None
-    rr = RECOVERY_TIME_RE.search(t)
-    if rr:
-        val = float(rr.group("val").replace(",", "."))
-        u = (rr.group("unit") or "s").lower()
-        if u.startswith("min"):
-            recovery_mode = "time"
-            recovery_seconds = val * 60
-        elif u in {"m", "mt", "metros"}:
-            recovery_mode = "distance"
-            recovery_meters = val
-        else:
-            recovery_mode = "time"
-            recovery_seconds = val
+    rc = _parse_recovery_phase(t)
+    if rc:
+        recovery_mode = rc.mode
+        recovery_seconds = rc.seconds
+        recovery_meters = rc.meters
+
+    wu = _parse_warmup_phase(t)
+    cd = _parse_cooldown_phase(t)
 
     name = f"{reps}x{int(meters)}m"
     if fast_c and slow_c and fast_c != slow_c:
@@ -261,8 +365,14 @@ def _parse_intent_regex(text: str) -> WorkoutIntent | None:
         recovery_mode=recovery_mode,
         recovery_seconds=recovery_seconds,
         recovery_meters=recovery_meters,
-        warmup=_wants_warmup(t),
-        cooldown=_wants_cooldown(t),
+        warmup=bool(wu) or _wants_warmup(t),
+        warmup_mode=wu.mode if wu else "lap",
+        warmup_seconds=wu.seconds if wu else None,
+        warmup_meters=wu.meters if wu else None,
+        cooldown=bool(cd) or _wants_cooldown(t),
+        cooldown_mode=cd.mode if cd else "lap",
+        cooldown_seconds=cd.seconds if cd else None,
+        cooldown_meters=cd.meters if cd else None,
     )
 
 
@@ -373,6 +483,19 @@ def _executable(
     return step
 
 
+def _phase_end_from_intent(
+    mode: str,
+    seconds: float | None,
+    meters: float | None,
+) -> tuple[str, int, float]:
+    """Retorna (end_key, end_id, end_value)."""
+    if mode == "time" and seconds and seconds > 0:
+        return "time", 2, float(seconds)
+    if mode == "distance" and meters and meters > 0:
+        return "distance", 3, float(meters)
+    return "lap.button", 1, 1000.0
+
+
 def build_workout_from_intent(intent: WorkoutIntent) -> WorkoutBody:
     """Agente 2: intent → JSON Garmin determinístico (sem LLM)."""
     if not intent.reps:
@@ -385,14 +508,17 @@ def build_workout_from_intent(intent: WorkoutIntent) -> WorkoutBody:
     order = 1
 
     if intent.warmup:
+        ek, eid, ev = _phase_end_from_intent(
+            intent.warmup_mode, intent.warmup_seconds, intent.warmup_meters
+        )
         steps.append(
             _executable(
                 order=order,
                 step_key="warmup",
                 step_id=1,
-                end_key="lap.button",
-                end_id=1,
-                end_value=1000,
+                end_key=ek,
+                end_id=eid,
+                end_value=ev,
             )
         )
         order += 1
@@ -420,36 +546,18 @@ def build_workout_from_intent(intent: WorkoutIntent) -> WorkoutBody:
             pace=pace,
         )
 
-    if intent.recovery_mode == "time" and intent.recovery_seconds:
-        recovery_step = _executable(
-            order=order + 2,
-            step_key="recovery",
-            step_id=4,
-            end_key="time",
-            end_id=2,
-            end_value=float(intent.recovery_seconds),
-            child_step_id=1,
-        )
-    elif intent.recovery_mode == "distance" and intent.recovery_meters:
-        recovery_step = _executable(
-            order=order + 2,
-            step_key="recovery",
-            step_id=4,
-            end_key="distance",
-            end_id=3,
-            end_value=float(intent.recovery_meters),
-            child_step_id=1,
-        )
-    else:
-        recovery_step = _executable(
-            order=order + 2,
-            step_key="recovery",
-            step_id=4,
-            end_key="lap.button",
-            end_id=1,
-            end_value=1000,
-            child_step_id=1,
-        )
+    rek, reid, rev = _phase_end_from_intent(
+        intent.recovery_mode, intent.recovery_seconds, intent.recovery_meters
+    )
+    recovery_step = _executable(
+        order=order + 2,
+        step_key="recovery",
+        step_id=4,
+        end_key=rek,
+        end_id=reid,
+        end_value=rev,
+        child_step_id=1,
+    )
 
     steps.append(
         {
@@ -472,14 +580,17 @@ def build_workout_from_intent(intent: WorkoutIntent) -> WorkoutBody:
     order += 1
 
     if intent.cooldown:
+        ek, eid, ev = _phase_end_from_intent(
+            intent.cooldown_mode, intent.cooldown_seconds, intent.cooldown_meters
+        )
         steps.append(
             _executable(
                 order=order,
                 step_key="cooldown",
                 step_id=2,
-                end_key="lap.button",
-                end_id=1,
-                end_value=1000,
+                end_key=ek,
+                end_id=eid,
+                end_value=ev,
             )
         )
 
@@ -511,24 +622,27 @@ def text_to_workout_body(text: str) -> WorkoutBody:
     """
     Pipeline:
       1) normalizar intent (regex → LLM)
-      2) montar JSON Garmin determinístico
+      2) reforçar aquecimento/recuperação/desaquecimento pelo texto
+      3) montar JSON Garmin determinístico
     """
     text = text.strip()
     if not text:
         raise ValueError("Texto de treino vazio")
 
     intent = normalize_intent(text)
-    # reforço final warmup/cooldown pelo texto do usuário
-    intent.warmup = intent.warmup or _wants_warmup(text)
-    intent.cooldown = intent.cooldown or _wants_cooldown(text)
+    intent = _apply_phase_to_intent(intent, text)
 
     logger.info(
-        "workout intent: reps=%s meters=%s pace_mode=%s %s-%s recovery=%s",
+        "workout intent: reps=%s meters=%s pace=%s-%s recovery=%s/%s warmup=%s/%s cooldown=%s/%s",
         intent.reps,
         intent.interval_meters,
-        intent.pace_mode,
         intent.pace_fast_clock,
         intent.pace_slow_clock,
         intent.recovery_mode,
+        intent.recovery_seconds or intent.recovery_meters,
+        intent.warmup_mode if intent.warmup else None,
+        intent.warmup_seconds or intent.warmup_meters,
+        intent.cooldown_mode if intent.cooldown else None,
+        intent.cooldown_seconds or intent.cooldown_meters,
     )
     return build_workout_from_intent(intent)
