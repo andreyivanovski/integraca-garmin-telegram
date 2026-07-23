@@ -2,7 +2,7 @@
 
 Cria, agenda e envia treinos para o Garmin Connect (e o relógio) a partir de linguagem natural. O canal principal é o **Telegram**; há também uma UI web mínima para setup/teste.
 
-> Exemplo: você manda `10x300m` no Telegram → o bot monta o workout, pergunta o dia, confirma e envia pro Fenix.
+> Exemplo: você manda `10x300m` ou `rodagem 25min` no Telegram → o bot monta o workout, pergunta o dia, confirma e envia pro Fenix.
 
 ---
 
@@ -35,7 +35,7 @@ Cria, agenda e envia treinos para o Garmin Connect (e o relógio) a partir de li
 
 ## Funcionalidades
 
-- **Texto → treino**: `10 vezes de 300 mt`, `8x400m com 90s`, aquecimento/desaquecimento só se você pedir
+- **Texto → treino**: intervalado (`10x300m`, `8x400m com 90s`) **ou** contínuo (`rodagem 25min`, `regenerativo 8km`, `rodagem de 20 pace 4:30-4:50`); aquecimento/desaquecimento só se você pedir
 - **Fluxo conversacional no Telegram**: rascunho → data (Hoje/Amanhã) → confirmação → envio
 - **Auth Garmin sem MFA todo dia**: login mobile SSO + MFA; access/refresh tokens em disco
 - **Credenciais por chat**: no Telegram o login fica associado ao `chat_id` (depois costuma pedir só MFA)
@@ -158,6 +158,7 @@ A SSO da Garmin limita tentativas. Se aparecer 429:
 
 ```text
 você:  10x300m
+       (ou: rodagem 25min / regenerativo 8km / rodagem de 20 pace 4:30-4:50)
 bot:   rascunho do workout
 bot:   [Hoje] [Amanhã]
 você:  (escolhe o dia)
@@ -230,7 +231,7 @@ app/
   garmin/
     client.py             # create / schedule / send / devices
     workout_schema.py     # validação do body Garmin
-  llm/workout_body.py     # Groq → JSON (+ fallback regex NxYm)
+  llm/workout_body.py     # texto → JSON (intervalado NxYm + rodagem/regenerativo)
   services/workout_flow.py
   telegram/
     bot.py                # conversa, menu, login por chat
