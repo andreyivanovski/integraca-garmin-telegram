@@ -30,6 +30,20 @@ INTERVAL_RE_ALT = re.compile(
     re.IGNORECASE,
 )
 
+# Rodagem / regenerativo / corrida contínua (sem repetições)
+_CONTINUOUS_LABEL = (
+    r"regenerativ\w*|rodagem|footing|"
+    r"corrida\s+(?:leve|cont[ií]nua|f[aá]cil)|"
+    r"easy\s*run|long\s*run|tiro\s+longo"
+)
+CONTINUOUS_KIND_RE = re.compile(rf"(?P<label>{_CONTINUOUS_LABEL})", re.IGNORECASE)
+# "rodagem 25min" / "rodagem de 20" (sem unidade → minutos)
+CONTINUOUS_BARE_DE_RE = re.compile(
+    rf"(?:{_CONTINUOUS_LABEL})\s+(?:de\s+)?(?P<val>\d+(?:[.,]\d+)?)"
+    r"(?:\s*(?P<unit>min|mins|minuto\w*|h|hora\w*|km|m|mt|metros))?",
+    re.IGNORECASE,
+)
+
 # ritmo/pace 01:06 a 01:20 | 1:06-1:20 | 5:00/km | 5:00 a 5:30 /km
 PACE_RANGE_RE = re.compile(
     r"(?:ritmo|pace|passo|em)?\s*"
@@ -110,6 +124,7 @@ NORMALIZE_SYSTEM = """Você é um extrator. Converte texto de treino de corrida 
 Responda APENAS JSON (sem markdown) neste schema:
 {
   "workout_name": string,
+  "kind": "interval"|"continuous",
   "reps": int|null,
   "interval_meters": number|null,
   "interval_seconds": number|null,
@@ -133,7 +148,7 @@ Responda APENAS JSON (sem markdown) neste schema:
 }
 
 REGRAS (obrigatórias):
-1) "10x400" / "10x 400" → reps=10, interval_meters=400
+1) "10x400" / "10x 400" → kind=interval, reps=10, interval_meters=400
 2) Distância em METROS (2,5km → 2500). Tempo em SEGUNDOS.
 3) "2,5km Aquecimento" / "Aquecimento 2,5km" → warmup distance 2500
 4) "Descanso parado de 3min" DEPOIS do aquecimento e ANTES dos tiros → pre_repeat_rest_* (NÃO recovery)
@@ -142,11 +157,16 @@ REGRAS (obrigatórias):
 7) Ritmo "5:00/km" → pace_mode=per_km
 8) warmup/cooldown = true só se o texto pedir
 9) sport sempre corrida
+10) "rodagem 25min" / "regenerativo 30 min" / "rodagem de 20 pace 4:30-4:50" →
+    kind=continuous, reps=null, interval_seconds=tempo (ou interval_meters se km).
+    Sem pace → pace_mode=none. Com faixa de ritmo em rodagem → pace_mode=per_km.
+11) kind=continuous NÃO usa reps nem recovery entre tiros
 """
 
 
 class WorkoutIntent(BaseModel):
     workout_name: str = "Treino"
+    kind: str = "interval"  # interval | continuous
     reps: int | None = None
     interval_meters: float | None = None
     interval_seconds: float | None = None
@@ -168,6 +188,14 @@ class WorkoutIntent(BaseModel):
     pre_repeat_rest_mode: str = "none"  # none | time | distance
     pre_repeat_rest_seconds: float | None = None
     pre_repeat_rest_meters: float | None = None
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _kind(cls, v: Any) -> str:
+        v = (str(v) if v is not None else "interval").lower().strip()
+        if v in {"continuous", "continuo", "contínuo", "steady", "easy", "rodagem", "regenerativo"}:
+            return "continuous"
+        return "interval"
 
     @field_validator("pace_mode", mode="before")
     @classmethod
@@ -299,6 +327,182 @@ def _parse_slash_pace(text: str) -> tuple[str, str] | None:
     b_sec = m.group("b")
     mins = a.split(":")[0]
     return a, f"{mins}:{b_sec}"
+
+
+def _strip_phase_spans(text: str) -> str:
+    """Remove aquecimento/desaquecimento/recovery para achar qty principal."""
+    t = text
+    for pat in (
+        WARMUP_PHASE_RE,
+        WARMUP_QTY_BEFORE_RE,
+        COOLDOWN_PHASE_RE,
+        COOLDOWN_QTY_BEFORE_RE,
+        INTER_RECOVERY_RE,
+        PRE_REST_RE,
+        RECOVERY_FALLBACK_RE,
+        PACE_RANGE_RE,
+        PACE_SINGLE_RE,
+        LAP_SLASH_PACE_RE,
+    ):
+        t = pat.sub(" ", t)
+    return t
+
+
+def _qty_to_continuous_end(
+    val: float, unit: str | None, *, bare_default_minutes: bool = False
+) -> tuple[float | None, float | None]:
+    """Retorna (meters, seconds)."""
+    unit = (unit or "").lower().strip()
+    if unit.startswith("min") or (bare_default_minutes and not unit):
+        return None, val * 60
+    if unit.startswith("hora") or unit == "h":
+        return None, val * 3600
+    if unit.startswith("km"):
+        return val * 1000, None
+    if unit in {"m", "mt", "metros"}:
+        return val, None
+    if unit.startswith("s") or unit.startswith("seg"):
+        return None, val
+    if bare_default_minutes:
+        return None, val * 60
+    return None, None
+
+
+def _parse_pace_from_text(text: str, *, default_per_km: bool = False) -> tuple[str, str | None, str | None]:
+    """Retorna (pace_mode, fast_clock, slow_clock)."""
+    pr = PACE_RANGE_RE.search(text)
+    if pr:
+        perkm = bool(pr.group("perkm")) or default_per_km
+        return ("per_km" if perkm else "lap_time"), pr.group("a"), pr.group("b")
+    ps = PACE_SINGLE_RE.search(text)
+    if ps:
+        perkm = bool(ps.group("perkm")) or default_per_km
+        return ("per_km" if perkm else "lap_time"), ps.group("a"), ps.group("a")
+    slash = _parse_slash_pace(text)
+    if slash:
+        return "lap_time", slash[0], slash[1]
+    return "none", None, None
+
+
+def _continuous_label_title(raw: str | None) -> str:
+    if not raw:
+        return "Rodagem"
+    low = raw.lower()
+    if low.startswith("regen"):
+        return "Regenerativo"
+    if "rodagem" in low:
+        return "Rodagem"
+    if "footing" in low:
+        return "Footing"
+    if "long" in low or "tiro" in low:
+        return "Longão"
+    return raw.strip().title()
+
+
+def _format_continuous_name(
+    label: str, meters: float | None, seconds: float | None, fast: str | None, slow: str | None
+) -> str:
+    if seconds and seconds > 0:
+        mins = int(round(seconds / 60))
+        if mins >= 60 and abs(seconds - mins * 60) < 1:
+            h, m = divmod(mins, 60)
+            qty = f"{h}h{m:02d}" if m else f"{h}h"
+        else:
+            qty = f"{mins}min"
+    elif meters and meters > 0:
+        qty = f"{meters / 1000:g}km" if meters >= 1000 else f"{int(meters)}m"
+    else:
+        qty = ""
+    name = f"{label} {qty}".strip()
+    if fast and slow and fast != slow:
+        name += f" @{fast}-{slow}"
+    elif fast:
+        name += f" @{fast}"
+    return name
+
+
+def _parse_continuous_intent(text: str) -> WorkoutIntent | None:
+    """Rodagem / regenerativo / corrida contínua com tempo ou distância."""
+    t = text.strip()
+    kind_m = CONTINUOUS_KIND_RE.search(t)
+    # Sem palavra-chave: só aceita se parecer corrida contínua explícita (tempo/dist + ritmo
+    # OU só tempo/dist sem padrão de intervalo). Evita engolir textos aleatórios.
+    if not kind_m:
+        # "25 min" / "8km" sozinho ou com pace — sem NxD
+        if INTERVAL_RE.search(t) or INTERVAL_RE_ALT.search(t):
+            return None
+        # exige unidade explícita de tempo ou km
+        loose = re.search(
+            r"(?P<val>\d+(?:[.,]\d+)?)\s*(?P<unit>min|mins|minuto\w*|h|hora\w*|km)\b",
+            t,
+            re.IGNORECASE,
+        )
+        if not loose:
+            return None
+        # sem keyword, só se tiver "corrida" ou pace ou for bem curto
+        if not re.search(r"corrida|pace|ritmo|passo", t, re.IGNORECASE) and len(t) > 40:
+            return None
+
+    label = _continuous_label_title(kind_m.group("label") if kind_m else None)
+    stripped = _strip_phase_spans(t)
+
+    meters: float | None = None
+    seconds: float | None = None
+
+    bare = CONTINUOUS_BARE_DE_RE.search(t)
+    if bare:
+        val = float(bare.group("val").replace(",", "."))
+        meters, seconds = _qty_to_continuous_end(
+            val, bare.group("unit"), bare_default_minutes=True
+        )
+
+    if meters is None and seconds is None:
+        # procura qty com unidade no texto limpo
+        for m in re.finditer(
+            r"(?P<val>\d+(?:[.,]\d+)?)\s*(?P<unit>min|mins|minuto\w*|h|hora\w*|km|m|mt|metros)\b",
+            stripped,
+            re.IGNORECASE,
+        ):
+            val = float(m.group("val").replace(",", "."))
+            meters, seconds = _qty_to_continuous_end(val, m.group("unit"))
+            if meters or seconds:
+                break
+
+    if meters is None and seconds is None:
+        # keyword sem qty → inválido (precisa tempo/distância)
+        if kind_m:
+            raise ValueError(
+                "Rodagem/regenerativo precisa de tempo ou distância "
+                "(ex: rodagem 25min ou regenerativo 8km)"
+            )
+        return None
+
+    pace_mode, fast_c, slow_c = _parse_pace_from_text(t, default_per_km=True)
+    # Em contínuo, lap_time sem metros de intervalo não faz sentido → força per_km
+    if pace_mode == "lap_time" and not meters:
+        pace_mode = "per_km"
+
+    wu = _parse_warmup_phase(t)
+    cd = _parse_cooldown_phase(t)
+
+    return WorkoutIntent(
+        workout_name=_format_continuous_name(label, meters, seconds, fast_c, slow_c),
+        kind="continuous",
+        reps=None,
+        interval_meters=meters,
+        interval_seconds=seconds,
+        pace_mode=pace_mode,
+        pace_fast_clock=fast_c,
+        pace_slow_clock=slow_c,
+        warmup=bool(wu) or _wants_warmup(t),
+        warmup_mode=wu.mode if wu else "lap",
+        warmup_seconds=wu.seconds if wu else None,
+        warmup_meters=wu.meters if wu else None,
+        cooldown=bool(cd) or _wants_cooldown(t),
+        cooldown_mode=cd.mode if cd else "lap",
+        cooldown_seconds=cd.seconds if cd else None,
+        cooldown_meters=cd.meters if cd else None,
+    )
 
 
 def _apply_phase_to_intent(intent: WorkoutIntent, text: str) -> WorkoutIntent:
@@ -476,6 +680,7 @@ def _parse_intent_regex(text: str) -> WorkoutIntent | None:
 
     return WorkoutIntent(
         workout_name=name,
+        kind="interval",
         reps=reps,
         interval_meters=meters,
         pace_mode=pace_mode,
@@ -538,10 +743,19 @@ def _parse_intent_llm(text: str) -> WorkoutIntent | None:
     return WorkoutIntent.model_validate(raw)
 
 
+def _intent_ready(intent: WorkoutIntent | None) -> bool:
+    if not intent:
+        return False
+    has_qty = bool(intent.interval_meters or intent.interval_seconds)
+    if intent.kind == "continuous":
+        return has_qty
+    return bool(intent.reps) and has_qty
+
+
 def normalize_intent(text: str) -> WorkoutIntent:
     """Agente 1: texto → intent estruturado (regex primeiro, LLM se precisar)."""
     intent = _parse_intent_regex(text)
-    if intent and intent.reps and (intent.interval_meters or intent.interval_seconds):
+    if _intent_ready(intent) and intent and intent.kind == "interval":
         # Se regex achou intervalo mas sem pace e o texto tem ritmo, tenta LLM só pro pace
         if intent.pace_mode == "none" and re.search(r"\d{1,2}:\d{2}", text):
             llm = _parse_intent_llm(text)
@@ -553,13 +767,41 @@ def normalize_intent(text: str) -> WorkoutIntent:
                     intent.workout_name = llm.workout_name
         return intent
 
+    continuous_err: ValueError | None = None
+    try:
+        continuous = _parse_continuous_intent(text)
+    except ValueError as exc:
+        continuous = None
+        continuous_err = exc
+    if _intent_ready(continuous) and continuous:
+        if continuous.pace_mode == "none" and re.search(r"\d{1,2}:\d{2}", text):
+            llm = _parse_intent_llm(text)
+            if llm and llm.pace_mode != "none":
+                continuous.pace_mode = (
+                    "per_km" if llm.pace_mode == "lap_time" else llm.pace_mode
+                )
+                continuous.pace_fast_clock = llm.pace_fast_clock
+                continuous.pace_slow_clock = llm.pace_slow_clock or llm.pace_fast_clock
+        return continuous
+
     llm = _parse_intent_llm(text)
     if llm:
-        return llm
-    if intent:
+        # LLM às vezes devolve interval sem reps para rodagem — normaliza
+        if llm.kind == "interval" and not llm.reps and (
+            llm.interval_meters or llm.interval_seconds
+        ):
+            llm.kind = "continuous"
+        if llm.kind == "continuous" and llm.pace_mode == "lap_time" and not llm.interval_meters:
+            llm.pace_mode = "per_km"
+        if _intent_ready(llm):
+            return llm
+    if continuous_err:
+        raise continuous_err
+    if intent and _intent_ready(intent):
         return intent
     raise ValueError(
-        "Não entendi o treino. Ex.: 10x400 ritmo 01:06 a 01:20"
+        "Não entendi o treino. Ex.: 10x400 ritmo 01:06 a 01:20 "
+        "ou rodagem 25min pace 4:30-4:50"
     )
 
 
@@ -618,14 +860,13 @@ def _phase_end_from_intent(
     return "lap.button", 1, 1000.0
 
 
-def build_workout_from_intent(intent: WorkoutIntent) -> WorkoutBody:
-    """Agente 2: intent → JSON Garmin determinístico (sem LLM)."""
-    if not intent.reps:
-        raise ValueError("Treino precisa de repetições (ex: 10x400)")
+def _build_continuous_steps(intent: WorkoutIntent, pace: PaceTarget | None) -> list[dict[str, Any]]:
+    """Rodagem/regenerativo: warmup opcional + bloco único + cooldown opcional."""
     if not intent.interval_meters and not intent.interval_seconds:
-        raise ValueError("Treino precisa de distância ou tempo no intervalo")
+        raise ValueError(
+            "Rodagem/regenerativo precisa de tempo ou distância (ex: rodagem 25min)"
+        )
 
-    pace = _resolve_pace(intent)
     steps: list[dict[str, Any]] = []
     order = 1
 
@@ -645,79 +886,30 @@ def build_workout_from_intent(intent: WorkoutIntent) -> WorkoutBody:
         )
         order += 1
 
-    # Descanso parado entre aquecimento e o bloco de tiros
-    if intent.pre_repeat_rest_mode in {"time", "distance"}:
-        ek, eid, ev = _phase_end_from_intent(
-            intent.pre_repeat_rest_mode,
-            intent.pre_repeat_rest_seconds,
-            intent.pre_repeat_rest_meters,
-        )
+    if intent.interval_meters:
         steps.append(
             _executable(
                 order=order,
-                step_key="rest",
-                step_id=5,
-                end_key=ek,
-                end_id=eid,
-                end_value=ev,
+                step_key="interval",
+                step_id=3,
+                end_key="distance",
+                end_id=3,
+                end_value=float(intent.interval_meters),
+                pace=pace,
             )
         )
-        order += 1
-
-    if intent.interval_meters:
-        interval_step = _executable(
-            order=order + 1,
-            step_key="interval",
-            step_id=3,
-            end_key="distance",
-            end_id=3,
-            end_value=float(intent.interval_meters),
-            child_step_id=1,
-            pace=pace,
-        )
     else:
-        interval_step = _executable(
-            order=order + 1,
-            step_key="interval",
-            step_id=3,
-            end_key="time",
-            end_id=2,
-            end_value=float(intent.interval_seconds or 0),
-            child_step_id=1,
-            pace=pace,
+        steps.append(
+            _executable(
+                order=order,
+                step_key="interval",
+                step_id=3,
+                end_key="time",
+                end_id=2,
+                end_value=float(intent.interval_seconds or 0),
+                pace=pace,
+            )
         )
-
-    rek, reid, rev = _phase_end_from_intent(
-        intent.recovery_mode, intent.recovery_seconds, intent.recovery_meters
-    )
-    recovery_step = _executable(
-        order=order + 2,
-        step_key="recovery",
-        step_id=4,
-        end_key=rek,
-        end_id=reid,
-        end_value=rev,
-        child_step_id=1,
-    )
-
-    steps.append(
-        {
-            "type": "RepeatGroupDTO",
-            "stepOrder": order,
-            "stepType": {"stepTypeId": 6, "stepTypeKey": "repeat", "displayOrder": 6},
-            "numberOfIterations": int(intent.reps),
-            "smartRepeat": False,
-            "childStepId": 1,
-            "skipLastRestStep": True,
-            "endCondition": {
-                "conditionTypeId": 7,
-                "conditionTypeKey": "iterations",
-                "displayOrder": 7,
-                "displayable": False,
-            },
-            "workoutSteps": [interval_step, recovery_step],
-        }
-    )
     order += 1
 
     if intent.cooldown:
@@ -734,6 +926,129 @@ def build_workout_from_intent(intent: WorkoutIntent) -> WorkoutBody:
                 end_value=ev,
             )
         )
+    return steps
+
+
+def build_workout_from_intent(intent: WorkoutIntent) -> WorkoutBody:
+    """Agente 2: intent → JSON Garmin determinístico (sem LLM)."""
+    if intent.kind == "continuous":
+        pace = _resolve_pace(intent)
+        steps = _build_continuous_steps(intent, pace)
+    else:
+        if not intent.reps:
+            raise ValueError("Treino precisa de repetições (ex: 10x400)")
+        if not intent.interval_meters and not intent.interval_seconds:
+            raise ValueError("Treino precisa de distância ou tempo no intervalo")
+
+        pace = _resolve_pace(intent)
+        steps = []
+        order = 1
+
+        if intent.warmup:
+            ek, eid, ev = _phase_end_from_intent(
+                intent.warmup_mode, intent.warmup_seconds, intent.warmup_meters
+            )
+            steps.append(
+                _executable(
+                    order=order,
+                    step_key="warmup",
+                    step_id=1,
+                    end_key=ek,
+                    end_id=eid,
+                    end_value=ev,
+                )
+            )
+            order += 1
+
+        # Descanso parado entre aquecimento e o bloco de tiros
+        if intent.pre_repeat_rest_mode in {"time", "distance"}:
+            ek, eid, ev = _phase_end_from_intent(
+                intent.pre_repeat_rest_mode,
+                intent.pre_repeat_rest_seconds,
+                intent.pre_repeat_rest_meters,
+            )
+            steps.append(
+                _executable(
+                    order=order,
+                    step_key="rest",
+                    step_id=5,
+                    end_key=ek,
+                    end_id=eid,
+                    end_value=ev,
+                )
+            )
+            order += 1
+
+        if intent.interval_meters:
+            interval_step = _executable(
+                order=order + 1,
+                step_key="interval",
+                step_id=3,
+                end_key="distance",
+                end_id=3,
+                end_value=float(intent.interval_meters),
+                child_step_id=1,
+                pace=pace,
+            )
+        else:
+            interval_step = _executable(
+                order=order + 1,
+                step_key="interval",
+                step_id=3,
+                end_key="time",
+                end_id=2,
+                end_value=float(intent.interval_seconds or 0),
+                child_step_id=1,
+                pace=pace,
+            )
+
+        rek, reid, rev = _phase_end_from_intent(
+            intent.recovery_mode, intent.recovery_seconds, intent.recovery_meters
+        )
+        recovery_step = _executable(
+            order=order + 2,
+            step_key="recovery",
+            step_id=4,
+            end_key=rek,
+            end_id=reid,
+            end_value=rev,
+            child_step_id=1,
+        )
+
+        steps.append(
+            {
+                "type": "RepeatGroupDTO",
+                "stepOrder": order,
+                "stepType": {"stepTypeId": 6, "stepTypeKey": "repeat", "displayOrder": 6},
+                "numberOfIterations": int(intent.reps),
+                "smartRepeat": False,
+                "childStepId": 1,
+                "skipLastRestStep": True,
+                "endCondition": {
+                    "conditionTypeId": 7,
+                    "conditionTypeKey": "iterations",
+                    "displayOrder": 7,
+                    "displayable": False,
+                },
+                "workoutSteps": [interval_step, recovery_step],
+            }
+        )
+        order += 1
+
+        if intent.cooldown:
+            ek, eid, ev = _phase_end_from_intent(
+                intent.cooldown_mode, intent.cooldown_seconds, intent.cooldown_meters
+            )
+            steps.append(
+                _executable(
+                    order=order,
+                    step_key="cooldown",
+                    step_id=2,
+                    end_key=ek,
+                    end_id=eid,
+                    end_value=ev,
+                )
+            )
 
     sport = {"sportTypeId": 1, "sportTypeKey": "running", "displayOrder": 1}
     raw = {
@@ -774,10 +1089,12 @@ def text_to_workout_body(text: str) -> WorkoutBody:
     intent = _apply_phase_to_intent(intent, text)
 
     logger.info(
-        "workout intent: reps=%s meters=%s pace=%s-%s recovery=%s/%s "
+        "workout intent: kind=%s reps=%s meters=%s secs=%s pace=%s-%s recovery=%s/%s "
         "warmup=%s/%s pre_rest=%s/%s cooldown=%s/%s",
+        intent.kind,
         intent.reps,
         intent.interval_meters,
+        intent.interval_seconds,
         intent.pace_fast_clock,
         intent.pace_slow_clock,
         intent.recovery_mode,

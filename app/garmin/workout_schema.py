@@ -222,10 +222,18 @@ class WorkoutBody(BaseModel):
                         child_bits.append(bit)
                     lines.append(f"- Repeat x{step.numberOfIterations}: {', '.join(child_bits)}")
                 else:
-                    lines.append(
-                        f"- {step.stepType.stepTypeKey}: "
+                    bit = (
+                        f"{step.stepType.stepTypeKey}/"
                         f"{step.endCondition.conditionTypeKey}={step.endConditionValue}"
                     )
+                    tt = getattr(step.targetType, "workoutTargetTypeKey", None) or "no.target"
+                    if tt == "pace.zone" and step.targetValueOne and step.targetValueTwo:
+                        def _fmt(mps: float) -> str:
+                            spk = 1000.0 / mps
+                            return f"{int(spk // 60)}:{int(spk % 60):02d}/km"
+
+                        bit += f" pace {_fmt(step.targetValueOne)}-{_fmt(step.targetValueTwo)}"
+                    lines.append(f"- {bit}")
         return "\n".join(lines)
 
 

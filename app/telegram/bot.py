@@ -233,7 +233,7 @@ async def _welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await _reply(
         update,
         "Oi! Pronto quando você estiver.\n\n"
-        "Manda o treino (ex: <b>10x300m</b>) ou toca em <b>Novo treino</b>.",
+        "Manda o treino (ex: <b>10x300m</b> ou <b>rodagem 25min</b>) ou toca em <b>Novo treino</b>.",
         with_menu=True,
     )
     return WAITING_WORKOUT
@@ -259,7 +259,7 @@ async def _after_auth_ok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         update.message.text = pending
         return await receive_workout(update, context)
 
-    await _reply(update, "Pode mandar o treino (ex: <b>10x300m</b>).", with_menu=True)
+    await _reply(update, "Pode mandar o treino (ex: <b>10x300m</b> ou <b>rodagem 25min</b>).", with_menu=True)
     return WAITING_WORKOUT
 
 
@@ -707,7 +707,7 @@ async def receive_workout(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     text = (update.message.text or "").strip()
     if not text or text.startswith("/"):
-        await _reply(update, "Manda o treino, tipo: <b>10x150m</b>", with_menu=True)
+        await _reply(update, "Manda o treino, tipo: <b>10x150m</b> ou <b>regenerativo 25min</b>", with_menu=True)
         return WAITING_WORKOUT
 
     # Botões / saudações dentro do fluxo — não tratam como treino
